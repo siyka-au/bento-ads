@@ -214,6 +214,7 @@ type adsCommInput struct {
 	symbolNames map[string]string // strings.ToLower(name) → configured casing (TC2 returns uppercase)
 
 	loadSymbols bool
+	localMode   bool
 
 	// Route registration settings
 	routeUsername    string
@@ -244,10 +245,19 @@ var adsConf = service.NewConfigSpec().
 	Field(service.NewStringField("routePassword").Description("Password for UDP route registration on the PLC.").Default("")).
 	Field(service.NewStringField("routeHostAddress").Description("The address the PLC should use to reach this client. Auto-detected from outbound connection if empty.").Default("")).
 	Field(service.NewBoolField("loadSymbols").Description("Download the full symbol and datatype table from the PLC on connect. Required for struct and array symbols. May cause a brief real-time jitter on the PLC; use with care on large programs.").Default(false)).
+	Field(service.NewBoolField("localMode").Description("Connect through the TwinCAT router on this machine (127.0.0.1) and let it assign the local AMS address, instead of using a route. Use for a runtime on the same host, e.g. a usermode runtime; targetAMS is still the runtime's own NetID.").Default(false).Advanced()).
 	Field(service.NewStringListField("symbols").Description("Symbols to read. Format: 'MAIN.var' or 'MAIN.var:maxDelayMs:cycleTimeMs'. " +
 		"Examples: 'MAIN.counter', '.globalCounter', 'MAIN.var:50:100'"))
 
 func newAdsCommInput(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchInput, error) {
+	m, err := adsCommInputFromConfig(conf, mgr)
+	if err != nil {
+		return nil, err
+	}
+	return service.AutoRetryNacksBatched(m), nil
+}
+
+func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) (*adsCommInput, error) {
 	logLevel, err := conf.FieldString("logLevel")
 	if err != nil {
 		return nil, err
@@ -376,6 +386,11 @@ func newAdsCommInput(conf *service.ParsedConfig, mgr *service.Resources) (servic
 		return nil, err
 	}
 
+	localMode, err := conf.FieldBool("localMode")
+	if err != nil {
+		return nil, err
+	}
+
 	// Derive hostAMS from routeHostAddress when set to "auto",
 	// matching the same convenience shortcut as the integrated plugin.
 	if hostAMS == "auto" && routeHostAddress != "" {
@@ -401,13 +416,14 @@ func newAdsCommInput(conf *service.ParsedConfig, mgr *service.Resources) (servic
 		done:             make(chan struct{}),
 		transmissionMode: transmissionMode,
 		loadSymbols:      loadSymbols,
+		localMode:        localMode,
 		routeUsername:    routeUsername,
 		routePassword:    routePassword,
 		routeHostAddress: routeHostAddress,
 		adsLogger:        adsLogger,
 	}
 
-	return service.AutoRetryNacksBatched(m), nil
+	return m, nil
 }
 
 func init() {
@@ -462,6 +478,9 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 	if g.adsLogger != nil {
 		connOpts = append(connOpts, adsLib.WithLogger(g.adsLogger))
 		adsLib.SetDefaultLogger(g.adsLogger)
+	}
+	if g.localMode {
+		connOpts = append(connOpts, adsLib.WithLocalMode())
 	}
 
 	if g.routeUsername != "" && g.routePassword != "" {
