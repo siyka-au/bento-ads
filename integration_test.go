@@ -117,6 +117,9 @@ func setSeed(t *testing.T, sess *adsLib.Session, seed uint32) {
 	}
 	for ctx.Err() == nil {
 		if v, err := sess.ReadFromSymbol(ctx, fb+"nUdintVar"); err == nil && v == want {
+			if os.Getenv("ADS_TEST_TRACE") != "" {
+				t.Logf("%s seed %d applied", time.Now().Format("05.000"), seed)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -128,6 +131,9 @@ func newIntegrationInput(t *testing.T, e plcEnv, readType string, extra string, 
 	t.Helper()
 	var b strings.Builder
 	fmt.Fprintf(&b, "targetIP: %s\ntargetAMS: %s\nruntimePort: %d\nlocalMode: %t\n", e.ip, e.netID, e.port, e.local)
+	if os.Getenv("ADS_TEST_TRACE") != "" {
+		extra += "\nlogLevel: debug"
+	}
 	fmt.Fprintf(&b, "readType: %s\nintervalTime: 100\ncycleTime: 10\nmaxDelay: 0\n%s\nsymbols:\n", readType, extra)
 	for _, s := range symbols {
 		fmt.Fprintf(&b, "  - %q\n", s)
@@ -163,6 +169,9 @@ func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name,
 		for _, msg := range batch {
 			raw, _ := msg.AsBytes()
 			name, _ := msg.MetaGet("symbol_name")
+			if os.Getenv("ADS_TEST_TRACE") != "" {
+				t.Logf("%s recv %s = %q", time.Now().Format("05.000"), name, raw)
+			}
 			if accept != nil && !accept(name, string(raw)) {
 				continue
 			}

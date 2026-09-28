@@ -3,6 +3,8 @@ package bentoads
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +18,12 @@ func parseTestInput(t *testing.T, yaml string) *adsCommInput {
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
-	in, err := adsCommInputFromConfig(conf, service.MockResources())
+	var opts []service.MockResourcesOptFn
+	if os.Getenv("ADS_TEST_TRACE") != "" {
+		opts = append(opts, service.MockResourcesOptUseSlogger(
+			slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	}
+	in, err := adsCommInputFromConfig(conf, service.MockResources(opts...))
 	if err != nil {
 		t.Fatalf("build input: %v", err)
 	}
