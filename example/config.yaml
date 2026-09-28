@@ -1,11 +1,12 @@
+# Connection settings come from the environment, e.g. a .env file:
+#   bento-ads -e .env -c example/config.yaml
 input:
   ads:
-    targetIP: '192.168.3.70'
-    targetAMS: '5.3.69.134.1.1'
-    targetPort: 48898
-    runtimePort: 851          # 801 for TwinCAT 2, 851 for TwinCAT 3
+    targetIP: ${ADS_TARGET_IP:192.168.1.100}
+    targetAMS: ${ADS_TARGET_NET_ID:192.168.1.100.1.1}
+    runtimePort: ${ADS_TARGET_PORT:851}  # 851 for TwinCAT 3, 801 for TwinCAT 2
+    localMode: ${ADS_LOCAL_MODE:false}
     hostAMS: 'auto'
-    hostPort: 10500
     readType: 'notification'  # or 'interval'
     maxDelay: 100
     cycleTime: 100

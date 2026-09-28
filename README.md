@@ -11,8 +11,23 @@ Daniel Helmersson (MIT), moved from the Benthos/Redpanda plugin API to Bento's
 
 ```sh
 go build -o bento-ads ./cmd/bento-ads
-./bento-ads -c example/config.yaml
+cp .env.example .env   # then set your PLC's IP, NetID and port
+./bento-ads -e .env -c example/config.yaml
 ```
+
+The example configs read the connection from `ADS_TARGET_IP`, `ADS_TARGET_NET_ID`,
+`ADS_TARGET_PORT` and `ADS_LOCAL_MODE`. `.env` is gitignored, so machine-specific
+values stay out of the repo.
+
+## Tests
+
+```sh
+go test .                          # unit tests, no PLC needed
+go test -run Integration -v .      # against a PLC, using .env
+```
+
+The integration tests expect the AdsGo_Testing PLC project
+(`siyka/ads-go/plc/testing`) and are skipped when `ADS_TARGET_NET_ID` is unset.
 
 `cmd/bento-ads` bundles every standard Bento component plus the `ads` input. To add
 the input to your own Bento build, blank-import the package:
@@ -44,6 +59,7 @@ See `example/config.yaml`. The fields are:
 | `transmissionMode` | `serverOnChange` | `serverOnChange`, `serverCycle`, `serverOnChange2`, `serverCycle2` |
 | `routeUsername` / `routePassword` | | If both are set, a route is registered on the PLC before connecting |
 | `routeHostAddress` | | The address the PLC uses to reach this host (auto-detected if empty) |
+| `localMode` | `false` | Connect through the local TwinCAT router (runtime on this machine) |
 | `loadSymbols` | `false` | Download the full symbol and datatype table on connect (needed for structs and arrays) |
 | `logLevel` | `disabled` | go-ads log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `symbols` | | `MAIN.var` or `MAIN.var:maxDelayMs:cycleTimeMs` |
