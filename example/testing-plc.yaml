@@ -8,6 +8,7 @@ input:
     runtimePort: ${ADS_TARGET_PORT:851}
     localMode: ${ADS_LOCAL_MODE:false}
     readType: 'interval'
+    loadSymbols: true   # needed for arrays and structs
     intervalTime: 1000
     symbols:
       - 'Main.fbTypeTest.nSeed'
@@ -15,13 +16,15 @@ input:
       - 'Main.fbTypeTest.nIntVar'
       - 'Main.fbTypeTest.fLrealVar'
       - 'Main.fbTypeTest.tTimeVar'
+      - 'Main.fbTypeTest.dtDateTimeVar'
+      - 'Main.fbTypeTest.aIntArray2d'
       - 'Main.fbTypeTest.sStringVar'
 
 pipeline:
   processors:
     - mapping: |
         root.symbol = meta("symbol_name")
-        root.value = content().string()
+        root.value = this
         root.data_type = meta("data_type")
 
 output:

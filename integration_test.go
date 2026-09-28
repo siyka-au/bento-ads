@@ -2,8 +2,9 @@ package bentoads
 
 // Integration tests against the AdsGo_Testing PLC project
 // (siyka/ads-go/plc/testing). Every output of Main.fbTypeTest is a
-// deterministic function of nSeed, so each test writes a seed and checks what
-// the ads input emits.
+// deterministic function of nSeed, so each test writes a seed and checks the
+// messages the ads input emits: their structured content against the Go value
+// the PLC holds, converted as toBento converts it, and their metadata.
 //
 // Skipped unless ADS_TARGET_NET_ID is set, in the environment or in a .env
 // file at the repo root (see .env.example):
@@ -11,18 +12,17 @@ package bentoads
 //	go test -run Integration -v .
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	adsLib "github.com/RuneRoven/go-ads/v2"
+	"cloud.google.com/go/civil"
+	adsLib "github.com/siyka-au/go-ads/v3"
 )
 
 const fb = "Main.fbTypeTest."
@@ -79,11 +79,10 @@ func integrationEnv(t *testing.T) plcEnv {
 	return e
 }
 
-// controlSession opens a plain go-ads session used to drive the PLC.
+// controlSession opens a plain go-ads session used to drive the PLC, and
+// restores nSeed and bAutoMode when the test ends.
 func controlSession(t *testing.T, e plcEnv) *adsLib.Session {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	target, err := adsLib.NewAMSAddress(e.netID, uint16(e.port))
 	if err != nil {
 		t.Fatal(err)
@@ -92,31 +91,45 @@ func controlSession(t *testing.T, e plcEnv) *adsLib.Session {
 	if e.local {
 		opts = append(opts, adsLib.WithLocalMode())
 	}
+	// NewSession's context bounds the session's lifetime; only Connect is timed.
 	sess, err := adsLib.NewSession(context.Background(), adsLib.AMSEndpoint{IP: e.ip, Port: 48898, AMS: target}, opts...)
 	if err != nil {
 		t.Fatalf("control session: %v", err)
 	}
 	t.Cleanup(func() { _ = sess.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if err := sess.Connect(ctx); err != nil {
 		t.Fatalf("control connect: %v", err)
 	}
+	saved, err := sess.ReadValues(ctx, []string{fb + "nSeed", fb + "bAutoMode"})
+	if err != nil {
+		t.Fatalf("read seed state: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := sess.WriteValues(context.Background(), saved); err != nil {
+			t.Errorf("restore nSeed/bAutoMode: %v", err)
+		}
+	})
 	return sess
 }
 
-// setSeed stops auto-increment, writes nSeed and waits for the PLC to apply it.
+// setSeed stops auto-increment, writes nSeed, and waits until both the write
+// (nSeed reads back) and a PLC cycle with it (nUdintVar, derived from nSeed)
+// are visible.
 func setSeed(t *testing.T, sess *adsLib.Session, seed uint32) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := sess.WriteToSymbol(ctx, fb+"bAutoMode", "false"); err != nil {
+	if err := sess.WriteValue(ctx, fb+"bAutoMode", false); err != nil {
 		t.Fatalf("write bAutoMode: %v", err)
 	}
-	want := strconv.FormatUint(uint64(seed), 10)
-	if err := sess.WriteToSymbol(ctx, fb+"nSeed", want); err != nil {
+	if err := sess.WriteValue(ctx, fb+"nSeed", seed); err != nil {
 		t.Fatalf("write nSeed: %v", err)
 	}
 	for ctx.Err() == nil {
-		if v, err := sess.ReadFromSymbol(ctx, fb+"nUdintVar"); err == nil && v == want {
+		v, err := sess.ReadValues(ctx, []string{fb + "nSeed", fb + "nUdintVar"})
+		if err == nil && v[fb+"nSeed"] == seed && v[fb+"nUdintVar"] == seed {
 			if os.Getenv("ADS_TEST_TRACE") != "" {
 				t.Logf("%s seed %d applied", time.Now().Format("05.000"), seed)
 			}
@@ -149,13 +162,13 @@ func newIntegrationInput(t *testing.T, e plcEnv, readType string, extra string, 
 }
 
 type sample struct {
-	value                        string
+	value                        any
 	dataType, baseType, dataSize string
 }
 
 // collect reads batches until every symbol has been seen with accept()
 // returning true, or the timeout passes. Keyed by symbol_name metadata.
-func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name, value string) bool) map[string]sample {
+func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name string, value any) bool) map[string]sample {
 	t.Helper()
 	got := map[string]sample{}
 	deadline := time.Now().Add(10 * time.Second)
@@ -167,15 +180,18 @@ func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name,
 			t.Fatalf("ReadBatch: %v", err)
 		}
 		for _, msg := range batch {
-			raw, _ := msg.AsBytes()
+			v, err := msg.AsStructured()
+			if err != nil {
+				t.Fatalf("message content is not structured: %v", err)
+			}
 			name, _ := msg.MetaGet("symbol_name")
 			if os.Getenv("ADS_TEST_TRACE") != "" {
-				t.Logf("%s recv %s = %q", time.Now().Format("05.000"), name, raw)
+				t.Logf("%s recv %s = %#v", time.Now().Format("05.000"), name, v)
 			}
-			if accept != nil && !accept(name, string(raw)) {
+			if accept != nil && !accept(name, v) {
 				continue
 			}
-			s := sample{value: string(raw)}
+			s := sample{value: v}
 			s.dataType, _ = msg.MetaGet("data_type")
 			s.baseType, _ = msg.MetaGet("base_type")
 			s.dataSize, _ = msg.MetaGet("data_size")
@@ -191,79 +207,57 @@ func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name,
 type scalarCase struct {
 	field, dataType string
 	size            int
-	value           func(s uint32) string
+	// value is the Go value the PLC holds for seed s, as go-ads returns it.
+	value func(s uint32) any
 }
 
-func u(v uint64) string { return strconv.FormatUint(v, 10) }
-func i(v int64) string  { return strconv.FormatInt(v, 10) }
+func unixDateTime(sec int64) civil.DateTime { return civil.DateTimeOf(time.Unix(sec, 0).UTC()) }
 
-// Expected values are what the PLC holds, written without reference to how
-// go-ads formats them, so a lossy or wrong format shows up as a failure.
+func timeOfDay(d time.Duration) civil.Time {
+	return civil.Time{Hour: int(d / time.Hour), Minute: int(d % time.Hour / time.Minute),
+		Second: int(d % time.Minute / time.Second), Nanosecond: int(d % time.Second)}
+}
+
+// data_type is what TwinCAT reports: the long names for TOD and DT, and STRING
+// without its length (go-ads normalises STRING(n)).
 var scalarCases = []scalarCase{
-	{"bBoolVar", "BOOL", 1, func(s uint32) string { return strconv.FormatBool(s%2 == 0) }},
-	{"nSintVar", "SINT", 1, func(s uint32) string { return i(int64(int8(s))) }},
-	{"nUsintVar", "USINT", 1, func(s uint32) string { return u(uint64(uint8(s))) }},
-	{"nByteVar", "BYTE", 1, func(s uint32) string { return u(uint64(uint8(s))) }},
-	{"nIntVar", "INT", 2, func(s uint32) string { return i(int64(int16(s))) }},
-	{"nUintVar", "UINT", 2, func(s uint32) string { return u(uint64(uint16(s))) }},
-	{"nWordVar", "WORD", 2, func(s uint32) string { return u(uint64(uint16(s))) }},
-	{"nDintVar", "DINT", 4, func(s uint32) string { return i(int64(int32(s))) }},
-	{"nUdintVar", "UDINT", 4, func(s uint32) string { return u(uint64(s)) }},
-	{"nDwordVar", "DWORD", 4, func(s uint32) string { return u(uint64(s)) }},
-	{"nLintVar", "LINT", 8, func(s uint32) string { return u(uint64(s)) }},
-	{"nUlintVar", "ULINT", 8, func(s uint32) string { return u(uint64(s)) }},
-	{"nLwordVar", "LWORD", 8, func(s uint32) string { return u(uint64(s)) }},
-	{"fRealVar", "REAL", 4, func(s uint32) string { return strconv.FormatFloat(float64(float32(s)), 'f', -1, 32) }},
-	{"fLrealVar", "LREAL", 8, func(s uint32) string { return strconv.FormatFloat(float64(s), 'f', -1, 64) }},
-	// TIME is a duration in ms: hours must not wrap at 24.
-	{"tTimeVar", "TIME", 4, func(s uint32) string { return clock(uint64(s), true) }},
-	// TOD is ms since midnight: seconds must survive.
-	{"tdTimeOfDayVar", "TIME_OF_DAY", 4, func(s uint32) string { return clock(uint64(s%86400000), true) }},
-	{"dDateVar", "DATE", 4, func(s uint32) string { return time.Unix(int64(s), 0).UTC().Format("2006-01-02") }},
-	{"dtDateTimeVar", "DATE_AND_TIME", 4, func(s uint32) string { return time.Unix(int64(s), 0).UTC().Format("2006-01-02 15:04:05") }},
-	{"sStringVar", "STRING(255)", 256, func(s uint32) string { return "S=" + u(uint64(s)) }},
+	{"bBoolVar", "BOOL", 1, func(s uint32) any { return s%2 == 0 }},
+	{"nSintVar", "SINT", 1, func(s uint32) any { return int8(s) }},
+	{"nUsintVar", "USINT", 1, func(s uint32) any { return uint8(s) }},
+	{"nByteVar", "BYTE", 1, func(s uint32) any { return uint8(s) }},
+	{"nIntVar", "INT", 2, func(s uint32) any { return int16(s) }},
+	{"nUintVar", "UINT", 2, func(s uint32) any { return uint16(s) }},
+	{"nWordVar", "WORD", 2, func(s uint32) any { return uint16(s) }},
+	{"nDintVar", "DINT", 4, func(s uint32) any { return int32(s) }},
+	{"nUdintVar", "UDINT", 4, func(s uint32) any { return s }},
+	{"nDwordVar", "DWORD", 4, func(s uint32) any { return s }},
+	{"nLintVar", "LINT", 8, func(s uint32) any { return int64(s) }},
+	{"nUlintVar", "ULINT", 8, func(s uint32) any { return uint64(s) }},
+	{"nLwordVar", "LWORD", 8, func(s uint32) any { return uint64(s) }},
+	{"fRealVar", "REAL", 4, func(s uint32) any { return float32(s) }},
+	{"fLrealVar", "LREAL", 8, func(s uint32) any { return float64(s) }},
+	{"tTimeVar", "TIME", 4, func(s uint32) any { return time.Duration(s) * time.Millisecond }},
+	{"tdTimeOfDayVar", "TIME_OF_DAY", 4, func(s uint32) any { return timeOfDay(time.Duration(s%86_400_000) * time.Millisecond) }},
+	{"dDateVar", "DATE", 4, func(s uint32) any { return unixDateTime(int64(s)).Date }}, // UDINT_TO_DATE keeps the day
+	{"dtDateTimeVar", "DATE_AND_TIME", 4, func(s uint32) any { return unixDateTime(int64(s)) }},
+	{"tLtimeVar", "LTIME", 8, func(s uint32) any { return time.Duration(s) }},
+	{"tdLTimeOfDayVar", "LTIME_OF_DAY", 8, func(s uint32) any { return timeOfDay(time.Duration(s)) }},
+	{"dLDateVar", "LDATE", 8, func(s uint32) any { return civil.DateOf(time.Unix(0, int64(s)).UTC()) }},
+	{"dtLDateTimeVar", "LDATE_AND_TIME", 8, func(s uint32) any { return civil.DateTimeOf(time.Unix(0, int64(s)).UTC()) }},
+	{"sStringVar", "STRING", 256, func(s uint32) any { return "S=" + strconv.FormatUint(uint64(s), 10) }},
 }
 
-// clock renders ms as H:MM:SS[.mmm], hours unbounded, in the style go-ads
-// uses for TIME below 24h.
-func clock(ms uint64, withMs bool) string {
-	h, rem := ms/3600000, ms%3600000
-	m, rem := rem/60000, rem%60000
-	sec, frac := rem/1000, rem%1000
-	out := fmt.Sprintf("%02d:%02d:%02d", h, m, sec)
-	if withMs && frac != 0 {
-		out += strings.TrimRight(fmt.Sprintf(".%03d", frac), "0")
+func scalarSymbols() []string {
+	out := make([]string, len(scalarCases))
+	for k, c := range scalarCases {
+		out[k] = fb + c.field
 	}
 	return out
 }
 
-// Seeds exercise sign wrap for the narrow types, a TIME past 24h, and a TOD
-// with non-zero seconds and milliseconds.
+// Seeds cover the sign wrap of each narrow type, a TIME over 24 h, a TOD with
+// seconds and milliseconds, and the top of UDINT.
 var seeds = []uint32{0, 1, 200, 40000, 100_001, 90_061_001, 4_000_000_000}
-
-func TestIntegrationScalarsInterval(t *testing.T) {
-	e := integrationEnv(t)
-	ctl := controlSession(t, e)
-
-	symbols := make([]string, len(scalarCases))
-	for k, c := range scalarCases {
-		symbols[k] = fb + c.field
-	}
-	in := newIntegrationInput(t, e, "interval", "", symbols)
-
-	for _, seed := range seeds {
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			setSeed(t, ctl, seed)
-			want := u(uint64(seed))
-			got := collect(t, in, symbols, nil)
-			// The batch is read after setSeed returns, so nUdintVar proves freshness.
-			if v := got[sanitize(fb+"nUdintVar")].value; v != want {
-				t.Fatalf("stale batch: nUdintVar = %q, want %q", v, want)
-			}
-			checkScalars(t, seed, got)
-		})
-	}
-}
 
 func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 	t.Helper()
@@ -273,8 +267,8 @@ func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 			t.Errorf("%s: no message", c.field)
 			continue
 		}
-		if want := c.value(seed); s.value != want {
-			t.Errorf("%s (%s): value %q, want %q", c.field, c.dataType, s.value, want)
+		if want := toBento(c.value(seed)); !reflect.DeepEqual(s.value, want) {
+			t.Errorf("%s (%s): %#v (%T), want %#v (%T)", c.field, c.dataType, s.value, s.value, want, want)
 		}
 		if s.dataType != c.dataType {
 			t.Errorf("%s: data_type %q, want %q", c.field, s.dataType, c.dataType)
@@ -288,25 +282,39 @@ func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 	}
 }
 
+func TestIntegrationScalarsInterval(t *testing.T) {
+	e := integrationEnv(t)
+	ctl := controlSession(t, e)
+	symbols := scalarSymbols()
+	in := newIntegrationInput(t, e, "interval", "", symbols)
+
+	for _, seed := range seeds {
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			setSeed(t, ctl, seed)
+			// Only a batch read after the seed landed counts.
+			got := collect(t, in, symbols, func(name string, v any) bool {
+				return name != sanitize(fb+"nUdintVar") || v == seed
+			})
+			checkScalars(t, seed, got)
+		})
+	}
+}
+
 func TestIntegrationScalarsNotification(t *testing.T) {
 	e := integrationEnv(t)
 	ctl := controlSession(t, e)
 	setSeed(t, ctl, 1)
-
-	symbols := make([]string, len(scalarCases))
-	for k, c := range scalarCases {
-		symbols[k] = fb + c.field
-	}
+	symbols := scalarSymbols()
 	in := newIntegrationInput(t, e, "notification", "", symbols)
 
-	// Every symbol changes between these two seeds, so on-change
-	// notifications must deliver all of them.
+	// Every symbol changes between these two seeds, so on-change notifications
+	// must deliver all of them; accept only the new values.
 	const seed = 100_002
 	setSeed(t, ctl, seed)
-	got := collect(t, in, symbols, func(name, value string) bool {
+	got := collect(t, in, symbols, func(name string, v any) bool {
 		for _, c := range scalarCases {
 			if sanitize(fb+c.field) == name {
-				return value != c.value(1)
+				return reflect.DeepEqual(v, toBento(c.value(seed)))
 			}
 		}
 		return false
@@ -314,20 +322,25 @@ func TestIntegrationScalarsNotification(t *testing.T) {
 	checkScalars(t, seed, got)
 }
 
-// The first value of each symbol is the PLC's initial sample on subscribe.
-// Connect must not swallow it: the pipeline should see every symbol once
-// even if nothing changes.
+// The first value of each symbol is the PLC's sample on subscribe. It must
+// reach the pipeline even if nothing changes afterwards.
 func TestIntegrationNotificationInitialSample(t *testing.T) {
 	e := integrationEnv(t)
 	ctl := controlSession(t, e)
 	setSeed(t, ctl, 7)
 
-	symbols := []string{fb + "nUdintVar", fb + "sStringVar"}
+	symbols := []string{fb + "nUdintVar", fb + "tTimeVar"}
 	in := newIntegrationInput(t, e, "notification", "", symbols)
 	got := collect(t, in, symbols, nil)
-	for _, s := range symbols {
-		if _, ok := got[sanitize(s)]; !ok {
-			t.Errorf("%s: initial value never reached ReadBatch", s)
+	want := map[string]any{
+		sanitize(fb + "nUdintVar"): uint32(7),
+		sanitize(fb + "tTimeVar"):  int64(7 * time.Millisecond),
+	}
+	for name, w := range want {
+		if s, ok := got[name]; !ok {
+			t.Errorf("%s: initial value never reached ReadBatch", name)
+		} else if s.value != w {
+			t.Errorf("%s = %#v, want %#v", name, s.value, w)
 		}
 	}
 }
@@ -341,20 +354,9 @@ func TestIntegrationIntervalPartialFailure(t *testing.T) {
 	good := fb + "nUdintVar"
 	in := newIntegrationInput(t, e, "interval", "", []string{good, fb + "doesNotExist"})
 	got := collect(t, in, []string{good}, nil)
-	if v := got[sanitize(good)].value; v != "5" {
-		t.Errorf("%s = %q alongside a bad symbol, want \"5\"", good, v)
+	if v := got[sanitize(good)].value; v != uint32(5) {
+		t.Errorf("%s = %#v alongside a bad symbol, want uint32(5)", good, v)
 	}
-}
-
-func decodeJSON(t *testing.T, raw string) map[string]any {
-	t.Helper()
-	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
-	dec.UseNumber()
-	var m map[string]any
-	if err := dec.Decode(&m); err != nil {
-		t.Fatalf("value is not a JSON object: %v\n%s", err, raw)
-	}
-	return m
 }
 
 func TestIntegrationStruct(t *testing.T) {
@@ -370,21 +372,19 @@ func TestIntegrationStruct(t *testing.T) {
 	if !ok {
 		t.Fatal("no message for struct")
 	}
-	t.Logf("data_type=%q base_type=%q data_size=%q", s.dataType, s.baseType, s.dataSize)
-	t.Logf("value=%s", s.value)
-	fields := decodeJSON(t, s.value)
-
-	if v := fmt.Sprint(fields["nSeed"]); v != u(seed) {
-		t.Errorf("nSeed = %s, want %d", v, seed)
+	if s.dataType != "ST_TypeTestStruct" {
+		t.Errorf("data_type %q, want ST_TypeTestStruct", s.dataType)
+	}
+	fields, ok := s.value.(map[string]any)
+	if !ok {
+		t.Fatalf("struct content is %T, want map[string]any", s.value)
+	}
+	if fields["nSeed"] != uint32(seed) {
+		t.Errorf("nSeed = %#v, want uint32(%d)", fields["nSeed"], seed)
 	}
 	for _, c := range scalarCases {
-		v, ok := fields[c.field]
-		if !ok {
-			t.Errorf("struct field %s missing", c.field)
-			continue
-		}
-		if got, want := fmt.Sprint(v), c.value(seed); got != want {
-			t.Errorf("struct field %s (%s) = %s, want %s", c.field, c.dataType, got, want)
+		if want := toBento(c.value(seed)); !reflect.DeepEqual(fields[c.field], want) {
+			t.Errorf("stStructVar.%s = %#v (%T), want %#v (%T)", c.field, fields[c.field], fields[c.field], want, want)
 		}
 	}
 }
@@ -399,42 +399,21 @@ func TestIntegrationArrays(t *testing.T) {
 	in := newIntegrationInput(t, e, "interval", "loadSymbols: true", []string{arr1, arr2d})
 	got := collect(t, in, []string{arr1, arr2d}, nil)
 
-	check := func(sym string, want map[string]string) {
-		s, ok := got[sanitize(sym)]
-		if !ok {
-			t.Errorf("%s: no message", sym)
-			return
-		}
-		t.Logf("%s value=%s", sym, s.value)
-		m := decodeJSON(t, s.value)
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for idx, w := range want {
-			v, ok := m[idx]
-			if !ok {
-				t.Errorf("%s: element %s missing (keys: %q)", sym, idx, keys)
-				continue
-			}
-			if fmt.Sprint(v) != w {
-				t.Errorf("%s%s = %v, want %s", sym, idx, v, w)
-			}
-		}
-	}
-
-	want1 := map[string]string{}
+	want1 := make([]any, 10)
 	for k := range uint32(10) {
-		want1[fmt.Sprintf("[%d]", k)] = i(int64(int16(seed + k)))
+		want1[k] = int16(seed + k)
 	}
-	check(arr1, want1)
-
-	want2 := map[string]string{}
+	want2 := make([]any, 3)
 	for a := range uint32(3) {
+		row := make([]any, 3)
 		for b := range uint32(3) {
-			want2[fmt.Sprintf("[%d,%d]", a, b)] = i(int64(int16(seed + a*3 + b)))
+			row[b] = int16(seed + a*3 + b)
+		}
+		want2[a] = row
+	}
+	for sym, want := range map[string][]any{arr1: want1, arr2d: want2} {
+		if v := got[sanitize(sym)].value; !reflect.DeepEqual(v, want) {
+			t.Errorf("%s = %#v, want %#v", sym, v, want)
 		}
 	}
-	check(arr2d, want2)
 }

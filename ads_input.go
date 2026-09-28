@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	adsLib "github.com/RuneRoven/go-ads/v2"
+	adsLib "github.com/siyka-au/go-ads/v3"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
@@ -412,7 +412,7 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		log:              mgr.Logger(),
 		intervalTime:     time.Duration(intervalTimeInt) * time.Millisecond,
 		requestTimeout:   time.Duration(requestTimeoutInt) * time.Millisecond,
-		notificationChan: make(chan *adsLib.Update, 256),
+		notificationChan: make(chan *adsLib.Update, 4096),
 		done:             make(chan struct{}),
 		transmissionMode: transmissionMode,
 		loadSymbols:      loadSymbols,
@@ -616,33 +616,9 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 			}
 		}
 
-		// Wait for initial sample from each registered symbol. TwinCAT sends an
-		// immediate sample on subscribe, so this completes quickly and ensures the
-		// first ReadBatch returns a full batch.
-		needed := make(map[string]bool, registered)
-		for i, r := range results {
-			if r.Skipped == nil && r.Error == adsLib.ReturnCodeNoErrors {
-				needed[strings.ToLower(configs[i].SymbolName)] = true
-			}
-		}
-		initialCtx, initialCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer initialCancel()
-		for len(needed) > 0 {
-			select {
-			case update := <-g.notificationChan:
-				if update != nil {
-					delete(needed, strings.ToLower(update.Variable))
-				}
-			case <-initialCtx.Done():
-				g.log.Warnf("Timed out waiting for initial samples; %d symbols not yet received: %v", len(needed), needed)
-				goto doneWaiting
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-g.done:
-				return service.ErrEndOfInput
-			}
-		}
-	doneWaiting:
+		// TwinCAT sends each symbol's current value on subscribe; it stays in the
+		// channel and becomes the first ReadBatch, so the pipeline starts from the
+		// PLC's actual state.
 	}
 
 	// Publish under the lock, re-checking done so a Close that ran while we were
@@ -657,13 +633,17 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (g *adsCommInput) makeNotificationMessage(update *adsLib.Update) *service.Message {
-	msg := service.NewMessage([]byte(update.Value))
-	key := strings.ToLower(update.Variable)
-	name := update.Variable
+// makeMessage builds the message for one symbol's value: the value converted to
+// Bento's types as structured content, and the symbol's name and type as
+// metadata.
+func (g *adsCommInput) makeMessage(symbol string, value any) *service.Message {
+	key := strings.ToLower(symbol)
+	name := symbol
 	if configured, ok := g.symbolNames[key]; ok {
-		name = configured
+		name = configured // TC2 reports names in upper case
 	}
+	msg := service.NewMessage(nil)
+	msg.SetStructuredMut(toBento(value))
 	msg.MetaSet("symbol_name", sanitize(name))
 	if dt, ok := g.dataTypes[key]; ok {
 		msg.MetaSet("data_type", dt)
@@ -690,12 +670,20 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		names[i] = symbol.name
 	}
 
-	values, err := sess.ReadMultipleSymbols(ctx, names)
-	if err != nil {
+	// A *BatchError names the symbols that failed and leaves the rest in values;
+	// any other error means the read as a whole failed.
+	values, err := sess.ReadValues(ctx, names)
+	var batchErr *adsLib.BatchError
+	switch {
+	case err == nil:
+	case errors.As(err, &batchErr):
+		for _, item := range batchErr.Items {
+			g.log.Warnf("Read failed: %v", item)
+		}
+	default:
 		if g.closed() {
 			return nil, nil, service.ErrEndOfInput
 		}
-		g.log.Errorf("Batch read failed: %v", err)
 		if sess.IsClosed() {
 			g.dropSession(sess)
 			return nil, nil, service.ErrNotConnected
@@ -723,49 +711,10 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		}
 	}
 
-	msgs := service.MessageBatch{}
+	msgs := make(service.MessageBatch, 0, len(values))
 	for _, symbol := range g.symbols {
-		val, ok := values[symbol.name]
-		if !ok {
-			continue
-		}
-		key := strings.ToLower(symbol.name)
-		valueMsg := service.NewMessage([]byte(val))
-		valueMsg.MetaSet("symbol_name", sanitize(symbol.name))
-		if dt, ok := g.dataTypes[key]; ok {
-			valueMsg.MetaSet("data_type", dt)
-		}
-		if bt, ok := g.baseTypes[key]; ok {
-			valueMsg.MetaSet("base_type", bt)
-		}
-		if sz, ok := g.dataSizes[key]; ok {
-			valueMsg.MetaSet("data_size", strconv.FormatUint(uint64(sz), 10))
-		}
-		msgs = append(msgs, valueMsg)
-	}
-
-	// Some PLCs don't support ADS sum read — fall back to individual reads.
-	if len(msgs) == 0 && len(g.symbols) > 0 {
-		g.log.Warnf("Batch read returned no results for %d symbols, falling back to individual reads", len(g.symbols))
-		for _, symbol := range g.symbols {
-			val, readErr := sess.ReadFromSymbol(ctx, symbol.name)
-			if readErr != nil {
-				g.log.Errorf("Individual read failed for %s: %v", symbol.name, readErr)
-				continue
-			}
-			key := strings.ToLower(symbol.name)
-			valueMsg := service.NewMessage([]byte(val))
-			valueMsg.MetaSet("symbol_name", sanitize(symbol.name))
-			if dt, ok := g.dataTypes[key]; ok {
-				valueMsg.MetaSet("data_type", dt)
-			}
-			if bt, ok := g.baseTypes[key]; ok {
-				valueMsg.MetaSet("base_type", bt)
-			}
-			if sz, ok := g.dataSizes[key]; ok {
-				valueMsg.MetaSet("data_size", strconv.FormatUint(uint64(sz), 10))
-			}
-			msgs = append(msgs, valueMsg)
+		if val, ok := values[symbol.name]; ok {
+			msgs = append(msgs, g.makeMessage(symbol.name, val))
 		}
 	}
 
@@ -803,14 +752,14 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 		return nil, func(_ context.Context, _ error) error { return nil }, nil
 	}
 
-	msgs := service.MessageBatch{g.makeNotificationMessage(first)}
+	msgs := service.MessageBatch{g.makeMessage(first.Variable, first.Value)}
 
 	// Drain all pending notifications without blocking to keep the channel buffer available.
 	for {
 		select {
 		case update := <-g.notificationChan:
 			if update != nil {
-				msgs = append(msgs, g.makeNotificationMessage(update))
+				msgs = append(msgs, g.makeMessage(update.Variable, update.Value))
 			}
 		default:
 			return msgs, func(_ context.Context, _ error) error { return nil }, nil

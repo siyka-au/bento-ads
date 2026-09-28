@@ -3,7 +3,8 @@ module github.com/siyka-au/bento-ads
 go 1.27.1
 
 require (
-	github.com/RuneRoven/go-ads/v2 v2.3.3
+	cloud.google.com/go v0.123.0
+	github.com/siyka-au/go-ads/v3 v3.0.0
 	github.com/warpstreamlabs/bento v1.21.2
 )
 
@@ -11,7 +12,6 @@ require (
 	buf.build/gen/go/bufbuild/reflect/connectrpc/go v1.18.1-20240117202343-bf8f65e8876c.1 // indirect
 	buf.build/gen/go/bufbuild/reflect/protocolbuffers/go v1.36.2-20240117202343-bf8f65e8876c.1 // indirect
 	cel.dev/expr v0.25.2 // indirect
-	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.18.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/bigquery v1.72.0 // indirect
@@ -435,8 +435,8 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-// Local fork of go-ads (github.com/siyka-au/go-ads).
-replace github.com/RuneRoven/go-ads/v2 => ../go-ads
+// go-ads is developed alongside; use the sibling checkout.
+replace github.com/siyka-au/go-ads/v3 => ../go-ads
 
 // Mirrors Bento's own replace (CVE GO-2026-5048 in archived hamba/avro); replace
 // directives in dependencies are not inherited. See warpstreamlabs/bento#960.

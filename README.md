@@ -1,7 +1,8 @@
 # bento-ads
 
 A [Bento](https://github.com/warpstreamlabs/bento) input plugin that reads data from
-Beckhoff PLCs over ADS, built on [go-ads](https://github.com/siyka-au/go-ads).
+Beckhoff PLCs over ADS, built on [go-ads](https://github.com/siyka-au/go-ads)
+(`github.com/siyka-au/go-ads/v3`).
 
 Started as a port of [benthosADS](https://github.com/RuneRoven/benthosADS) by
 Daniel Helmersson (MIT), moved from the Benthos/Redpanda plugin API to Bento's
@@ -64,8 +65,41 @@ See `example/config.yaml`. The fields are:
 | `logLevel` | `disabled` | go-ads log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `symbols` | | `MAIN.var` or `MAIN.var:maxDelayMs:cycleTimeMs` |
 
-Each message is one symbol value, with metadata `symbol_name`, `data_type`,
-`base_type` and `data_size`.
+## Messages
+
+Each message is one symbol's value as structured content, with metadata
+`symbol_name`, `data_type` (as TwinCAT reports it), `base_type` and `data_size`.
+
+go-ads returns values as Go types; the input converts them to Bento's own types
+and does no further formatting:
+
+| PLC type | Message value |
+|---|---|
+| `BOOL`, integers, `REAL`/`LREAL`, `STRING`/`WSTRING` | the Go type as is (`bool`, `int16`, `uint32`, `float32`, `string`, ...) |
+| `DT`, `LDT` | timestamp (`time.Time`, UTC) |
+| `DATE`, `LDATE` | timestamp at midnight UTC |
+| `TIME`, `LTIME` | integer nanoseconds, as Bloblang's `parse_duration` gives |
+| `TOD`, `LTOD` | integer nanoseconds since midnight |
+| struct | object keyed by member name |
+| array | array in index order, nested per dimension |
+
+How a value is rendered is left to the pipeline, for example:
+
+```yaml
+pipeline:
+  processors:
+    - mapping: |
+        root.value = match {
+          meta("data_type") == "DATE_AND_TIME" => this.ts_format("2006-01-02T15:04:05Z07:00"),
+          meta("data_type") == "TIME" => this / 1000000,   # milliseconds
+          _ => this,
+        }
+```
+
+Use `match` without an expression, as here: `match meta("data_type") { ... }`
+rebinds `this` to the data type string.
+
+A timestamp left as is is written as RFC 3339 when the message is serialised.
 
 ## License
 
