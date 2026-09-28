@@ -1,0 +1,34 @@
+input:
+  ads:
+    targetIP: '192.168.3.70'
+    targetAMS: '5.3.69.134.1.1'
+    targetPort: 48898
+    runtimePort: 851          # 801 for TwinCAT 2, 851 for TwinCAT 3
+    hostAMS: 'auto'
+    hostPort: 10500
+    readType: 'notification'  # or 'interval'
+    maxDelay: 100
+    cycleTime: 100
+    intervalTime: 1000
+    logLevel: 'disabled'      # trace, debug, info, warn, error
+    symbols:
+      - 'MAIN.MYBOOL'
+      - 'MAIN.MYTRIGGER:0:10' # name:maxDelayMs:cycleTimeMs
+      - '.superDuperInt'
+
+pipeline:
+  processors:
+    - mapping: |
+        root = {
+          meta("symbol_name"): this,
+          "data_type": meta("data_type"),
+          "timestamp_ms": (timestamp_unix_nano() / 1000000).floor()
+        }
+
+output:
+  stdout: {}
+
+logger:
+  level: INFO
+  format: logfmt
+  add_timestamp: true
