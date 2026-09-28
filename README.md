@@ -33,7 +33,7 @@ See `example/config.yaml`. The fields are:
 | `targetIP` | | IP address of the PLC |
 | `targetAMS` | | AMS NetID of the PLC |
 | `targetPort` | `48898` | TCP port of the PLC ADS gateway |
-| `runtimePort` | `801` | ADS port of the runtime (801 = TwinCAT 2, 851 = TwinCAT 3) |
+| `runtimePort` | `851` | ADS port of the runtime (851 = TwinCAT 3, 801 = TwinCAT 2) |
 | `hostAMS` | `auto` | Local AMS NetID; `auto` derives it from the outbound source IP |
 | `hostPort` | `10500` | Local AMS port |
 | `readType` | `notification` | `notification` or `interval` |

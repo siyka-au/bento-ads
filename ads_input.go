@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	adsLib "github.com/RuneRoven/go-ads/v2"
@@ -190,14 +191,21 @@ type adsCommInput struct {
 	maxDelay         int
 	intervalTime     time.Duration
 	requestTimeout   time.Duration
-	handler          *adsLib.Session
 	log              *service.Logger
 	symbols          []plcSymbol
 	notificationChan chan *adsLib.Update
 	transmissionMode adsLib.TransMode
 
-	// Shutdown signal — closed by Close() to unblock ReadBatchNotification.
-	done chan struct{}
+	// mu guards handler. Bento calls Connect and ReadBatch from one goroutine
+	// and Close from another, so readers take a snapshot via session() and
+	// never touch the field directly.
+	mu      sync.Mutex
+	handler *adsLib.Session
+
+	// Shutdown signal — closed once by Close() to unblock ReadBatchNotification.
+	// Created in the constructor and never reassigned.
+	done      chan struct{}
+	closeOnce sync.Once
 
 	// Symbol metadata populated lazily after connect (from go-ads cache, no extra round-trips).
 	dataTypes   map[string]string
@@ -222,7 +230,7 @@ var adsConf = service.NewConfigSpec().
 	Field(service.NewStringField("targetIP").Description("IP address of the Beckhoff PLC.")).
 	Field(service.NewStringField("targetAMS").Description("Target AMS net ID.")).
 	Field(service.NewIntField("targetPort").Description("TCP port of the PLC ADS gateway.").Default(48898)).
-	Field(service.NewIntField("runtimePort").Description("Target runtime port. 801 for TwinCAT 2, 851 for TwinCAT 3.").Default(801)).
+	Field(service.NewIntField("runtimePort").Description("Target runtime port. 851 for TwinCAT 3 (PLC1), 801 for TwinCAT 2.").Default(851)).
 	Field(service.NewStringField("hostAMS").Description("Local AMS net ID. 'auto' derives it from the outbound TCP source IP.").Default("auto")).
 	Field(service.NewIntField("hostPort").Description("AMS source port used in protocol headers. Any arbitrary value works.").Default(10500)).
 	Field(service.NewStringField("readType").Description("Read type, interval or notification (default).").Default("notification")).
@@ -413,13 +421,39 @@ func init() {
 	}
 }
 
-func (g *adsCommInput) Connect(ctx context.Context) error {
-	if g.handler != nil {
-		return nil
-	}
+// session returns the current handler, or nil when not connected.
+func (g *adsCommInput) session() *adsLib.Session {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.handler
+}
 
-	if g.done == nil {
-		g.done = make(chan struct{})
+// dropSession clears handler if it is still sess and closes sess in the
+// background. It is a no-op if Close or a reconnect already replaced it.
+func (g *adsCommInput) dropSession(sess *adsLib.Session) {
+	g.mu.Lock()
+	if g.handler == sess {
+		g.handler = nil
+	}
+	g.mu.Unlock()
+	go func() { _ = sess.Close() }()
+}
+
+func (g *adsCommInput) closed() bool {
+	select {
+	case <-g.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *adsCommInput) Connect(ctx context.Context) error {
+	if g.closed() {
+		return service.ErrEndOfInput
+	}
+	if g.session() != nil {
+		return nil
 	}
 
 	g.log.Infof("Creating new connection")
@@ -478,7 +512,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 
 	// Use Background ctx for session lifetime — Bento passes a per-call ctx to Connect
 	// that would tear the session down as soon as Connect returns. Teardown is driven by Close().
-	g.handler, err = adsLib.NewSession(context.Background(), adsLib.AMSEndpoint{
+	sess, err := adsLib.NewSession(context.Background(), adsLib.AMSEndpoint{
 		IP:   g.targetIP,
 		Port: g.targetPort,
 		AMS:  targetAMS,
@@ -490,14 +524,13 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 
 	success := false
 	defer func() {
-		if !success && g.handler != nil {
-			_ = g.handler.Close()
-			g.handler = nil
+		if !success {
+			_ = sess.Close()
 		}
 	}()
 
 	g.log.Infof("Connecting to PLC")
-	if err = g.handler.Connect(ctx); err != nil {
+	if err = sess.Connect(ctx); err != nil {
 		g.log.Errorf("Failed to connect to PLC at %s: %v", g.targetIP, err)
 		return err
 	}
@@ -512,7 +545,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 
 	if g.loadSymbols {
 		g.log.Infof("Loading symbol and datatype table from PLC (loadSymbols=true)")
-		if err = g.handler.LoadSymbols(ctx); err != nil {
+		if err = sess.LoadSymbols(ctx); err != nil {
 			g.log.Errorf("LoadSymbols failed: %v", err)
 			return err
 		}
@@ -530,7 +563,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 			}
 		}
 
-		results, err := g.handler.AddSymbolNotifications(ctx, configs, g.notificationChan)
+		results, err := sess.AddSymbolNotifications(ctx, configs, g.notificationChan)
 		if err != nil {
 			g.log.Errorf("Batch add notifications failed: %v", err)
 			return err
@@ -555,7 +588,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		// Populate metadata cache — symbols are in go-ads cache after AddSymbolNotifications.
 		for _, sym := range g.symbols {
 			key := strings.ToLower(sym.name)
-			if view, viewErr := g.handler.GetSymbol(ctx, sym.name); viewErr == nil {
+			if view, viewErr := sess.GetSymbol(ctx, sym.name); viewErr == nil {
 				g.dataTypes[key] = view.DataType
 				g.dataSizes[key] = view.Length
 				if bt := view.BaseTypeName(); bt != "" {
@@ -586,11 +619,21 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 				goto doneWaiting
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-g.done:
+				return service.ErrEndOfInput
 			}
 		}
 	doneWaiting:
 	}
 
+	// Publish under the lock, re-checking done so a Close that ran while we were
+	// connecting can't miss this session and leak it.
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed() {
+		return service.ErrEndOfInput
+	}
+	g.handler = sess
 	success = true
 	return nil
 }
@@ -618,7 +661,8 @@ func (g *adsCommInput) makeNotificationMessage(update *adsLib.Update) *service.M
 func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	g.log.Debugf("ReadBatchPull called")
 	start := time.Now()
-	if g.handler == nil {
+	sess := g.session()
+	if sess == nil {
 		return nil, nil, service.ErrNotConnected
 	}
 
@@ -627,13 +671,14 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		names[i] = symbol.name
 	}
 
-	values, err := g.handler.ReadMultipleSymbols(ctx, names)
+	values, err := sess.ReadMultipleSymbols(ctx, names)
 	if err != nil {
+		if g.closed() {
+			return nil, nil, service.ErrEndOfInput
+		}
 		g.log.Errorf("Batch read failed: %v", err)
-		if g.handler.IsClosed() {
-			old := g.handler
-			g.handler = nil
-			go func() { _ = old.Close() }()
+		if sess.IsClosed() {
+			g.dropSession(sess)
 			return nil, nil, service.ErrNotConnected
 		}
 		g.log.Warnf("Batch read failed (will retry): %v", err)
@@ -649,7 +694,7 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 	for _, sym := range g.symbols {
 		key := strings.ToLower(sym.name)
 		if _, ok := g.dataTypes[key]; !ok {
-			if view, viewErr := g.handler.GetSymbol(ctx, sym.name); viewErr == nil {
+			if view, viewErr := sess.GetSymbol(ctx, sym.name); viewErr == nil {
 				g.dataTypes[key] = view.DataType
 				g.dataSizes[key] = view.Length
 				if bt := view.BaseTypeName(); bt != "" {
@@ -684,7 +729,7 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 	if len(msgs) == 0 && len(g.symbols) > 0 {
 		g.log.Warnf("Batch read returned no results for %d symbols, falling back to individual reads", len(g.symbols))
 		for _, symbol := range g.symbols {
-			val, readErr := g.handler.ReadFromSymbol(ctx, symbol.name)
+			val, readErr := sess.ReadFromSymbol(ctx, symbol.name)
 			if readErr != nil {
 				g.log.Errorf("Individual read failed for %s: %v", symbol.name, readErr)
 				continue
@@ -732,9 +777,8 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 	case <-g.done:
 		return nil, nil, service.ErrEndOfInput
 	case <-waitCtx.Done():
-		if g.handler != nil && g.handler.IsClosed() {
-			_ = g.handler.Close()
-			g.handler = nil
+		if sess := g.session(); sess != nil && sess.IsClosed() {
+			g.dropSession(sess)
 			return nil, nil, service.ErrNotConnected
 		}
 		return nil, func(_ context.Context, _ error) error { return nil }, nil
@@ -756,7 +800,7 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 }
 
 func (g *adsCommInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
-	g.log.Infof("ReadBatch called")
+	g.log.Debugf("ReadBatch called")
 	if g.readType == "notification" {
 		return g.ReadBatchNotification(ctx)
 	}
@@ -767,17 +811,19 @@ func (g *adsCommInput) ReadBatch(ctx context.Context) (service.MessageBatch, ser
 //
 //nolint:revive
 func (g *adsCommInput) Close(ctx context.Context) error {
-	g.log.Infof("Close called")
-	if g.done != nil {
-		close(g.done)
-		g.done = nil
-	}
-	if g.handler != nil {
+	g.log.Debugf("Close called")
+	g.closeOnce.Do(func() { close(g.done) })
+
+	g.mu.Lock()
+	sess := g.handler
+	g.handler = nil
+	g.mu.Unlock()
+
+	if sess != nil {
 		g.log.Infof("Closing down, cleaning up PLC handles")
-		if cerr := g.handler.Close(); cerr != nil {
+		if cerr := sess.Close(); cerr != nil {
 			g.log.Warnf("Handler close error: %v", cerr)
 		}
-		g.handler = nil
 	}
 	return nil
 }
