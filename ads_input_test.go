@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/siyka-au/go-ads/v3/ams"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
@@ -47,14 +48,33 @@ func TestConfigDefaults(t *testing.T) {
 	if in.localMode {
 		t.Error("localMode defaults to true, want false")
 	}
+	if in.transmissionMode != ams.TransModeServerOnChange {
+		t.Errorf("transmissionMode = %v, want serverOnChange", in.transmissionMode)
+	}
+}
+
+func TestConfigTransmissionModes(t *testing.T) {
+	for name, want := range map[string]ams.TransMode{
+		"serverOnChange":  ams.TransModeServerOnChange,
+		"serverCycle":     ams.TransModeServerCycle,
+		"serverOnChange2": ams.TransModeServerOnChange2,
+		"serverCycle2":    ams.TransModeServerCycle2,
+	} {
+		in := parseTestInput(t, minimalConfig+"transmissionMode: "+name+"\n")
+		if in.transmissionMode != want {
+			t.Errorf("transmissionMode %q = %v, want %v", name, in.transmissionMode, want)
+		}
+	}
 }
 
 func TestConfigValidation(t *testing.T) {
 	for name, yaml := range map[string]string{
-		"bad targetIP":  "targetIP: 1.2.3\ntargetAMS: 1.2.3.4.1.1\nsymbols: [a]",
-		"bad targetAMS": "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1\nsymbols: [a]",
-		"bad readType":  "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1.1\nreadType: poll\nsymbols: [a]",
-		"bad hostAMS":   "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1.1\nhostAMS: 1.2.3.999.1.1\nsymbols: [a]",
+		"bad targetIP":         "targetIP: 1.2.3\ntargetAMS: 1.2.3.4.1.1\nsymbols: [a]",
+		"bad targetAMS":        "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1\nsymbols: [a]",
+		"bad readType":         "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1.1\nreadType: poll\nsymbols: [a]",
+		"bad hostAMS":          "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1.1\nhostAMS: 1.2.3.999.1.1\nsymbols: [a]",
+		"IPv6 targetIP":        "targetIP: \"::1\"\ntargetAMS: 1.2.3.4.1.1\nsymbols: [a]",
+		"bad transmissionMode": "targetIP: 1.2.3.4\ntargetAMS: 1.2.3.4.1.1\ntransmissionMode: onChange\nsymbols: [a]",
 	} {
 		t.Run(name, func(t *testing.T) {
 			conf, err := adsConf.ParseYAML(yaml, nil)

@@ -23,6 +23,7 @@ import (
 
 	"cloud.google.com/go/civil"
 	adsLib "github.com/siyka-au/go-ads/v3"
+	"github.com/siyka-au/go-ads/v3/ams"
 )
 
 const fb = "Main.fbTypeTest."
@@ -83,16 +84,16 @@ func integrationEnv(t *testing.T) plcEnv {
 // restores nSeed and bAutoMode when the test ends.
 func controlSession(t *testing.T, e plcEnv) *adsLib.Session {
 	t.Helper()
-	target, err := adsLib.NewAMSAddress(e.netID, uint16(e.port))
+	target, err := ams.NewAddress(e.netID, ams.Port(e.port))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var opts []adsLib.SessionOption
+	var opts []adsLib.Option
 	if e.local {
 		opts = append(opts, adsLib.WithLocalMode())
 	}
 	// NewSession's context bounds the session's lifetime; only Connect is timed.
-	sess, err := adsLib.NewSession(context.Background(), adsLib.AMSEndpoint{IP: e.ip, Port: 48898, AMS: target}, opts...)
+	sess, err := adsLib.NewSession(context.Background(), adsLib.Endpoint{Host: e.ip, Port: 48898, Target: target}, opts...)
 	if err != nil {
 		t.Fatalf("control session: %v", err)
 	}

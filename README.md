@@ -58,7 +58,7 @@ See `example/config.yaml`. The fields are:
 | `intervalTime` | `1000` | Poll interval for `interval` mode (ms) |
 | `requestTimeout` | `5000` | Per-request timeout (ms) |
 | `transmissionMode` | `serverOnChange` | `serverOnChange`, `serverCycle`, `serverOnChange2`, `serverCycle2` |
-| `routeUsername` / `routePassword` | | If both are set, a route is registered on the PLC before connecting |
+| `routeUsername` / `routePassword` | | If both are set, a route is registered on the PLC before connecting. It is named after the address it points at |
 | `routeHostAddress` | | The address the PLC uses to reach this host (auto-detected if empty) |
 | `localMode` | `false` | Connect through the local TwinCAT router (runtime on this machine) |
 | `loadSymbols` | `false` | Download the full symbol and datatype table on connect (needed for structs and arrays) |

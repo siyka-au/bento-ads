@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,10 +16,11 @@ import (
 	"time"
 
 	adsLib "github.com/siyka-au/go-ads/v3"
+	"github.com/siyka-au/go-ads/v3/ams"
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
-// bentoLogHandler bridges go-ads v2 slog-based logging into Bento's logging infrastructure.
+// bentoLogHandler bridges go-ads's slog-based logging into Bento's logging infrastructure.
 type bentoLogHandler struct {
 	logger *service.Logger
 	level  slog.Level
@@ -62,36 +63,6 @@ func (h *bentoLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *bentoLogHandler) WithGroup(_ string) slog.Handler { return h }
 
-// validateIP checks that s is a valid IPv4 address (4 dot-separated octets, each 0–255).
-func validateIP(s string) error {
-	parts := strings.Split(s, ".")
-	if len(parts) != 4 {
-		return fmt.Errorf("%q must have 4 dot-separated octets", s)
-	}
-	for _, p := range parts {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 0 || v > 255 {
-			return fmt.Errorf("%q contains invalid octet %q (must be 0–255)", s, p)
-		}
-	}
-	return nil
-}
-
-// validateAMSNetID checks that s is a valid AMS NetID (6 dot-separated octets, each 0–255).
-func validateAMSNetID(s string) error {
-	parts := strings.Split(s, ".")
-	if len(parts) != 6 {
-		return fmt.Errorf("%q must have 6 dot-separated octets (e.g. 192.168.1.100.1.1)", s)
-	}
-	for _, p := range parts {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 0 || v > 255 {
-			return fmt.Errorf("%q contains invalid octet %q (must be 0–255)", s, p)
-		}
-	}
-	return nil
-}
-
 func slogLevelFromString(level string) slog.Level {
 	switch level {
 	case "trace":
@@ -115,35 +86,23 @@ type plcSymbol struct {
 	cycleTime time.Duration
 }
 
+// symbolMeta is what makeMessage needs to label a value, keyed by the symbol
+// name exactly as configured (subscribe and read now echo that spelling back
+// in Update.Symbol and ReadValues, so no casing normalisation is needed).
+type symbolMeta struct {
+	dataType string
+	baseType string
+	size     uint32
+}
+
+// symbolMetaFrom extracts the fields makeMessage needs from a SymbolView.
+func symbolMetaFrom(v adsLib.SymbolView) symbolMeta {
+	return symbolMeta{dataType: v.DataType, baseType: v.BaseTypeName(), size: v.Length}
+}
+
 func sanitize(s string) string {
 	re := regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 	return re.ReplaceAllString(s, "_")
-}
-
-// isLikelyContainerIP checks if an IP address looks like a Docker/container-internal
-// address that is probably not routable from an external PLC network.
-func isLikelyContainerIP(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	p := parsed.To4()
-	if p == nil {
-		return false
-	}
-	// Docker default bridge: 172.17.0.0/16
-	if p[0] == 172 && p[1] >= 17 && p[1] <= 31 {
-		return true
-	}
-	// Common container overlay/pod networks: 10.0.0.0/8
-	if p[0] == 10 {
-		return true
-	}
-	// CGNAT range used by some Kubernetes CNIs: 100.64.0.0/10
-	if p[0] == 100 && p[1] >= 64 && p[1] <= 127 {
-		return true
-	}
-	return false
 }
 
 // createSymbolList parses symbol strings into plcSymbol structs.
@@ -194,7 +153,7 @@ type adsCommInput struct {
 	log              *service.Logger
 	symbols          []plcSymbol
 	notificationChan chan *adsLib.Update
-	transmissionMode adsLib.TransMode
+	transmissionMode ams.TransMode
 
 	// mu guards handler. Bento calls Connect and ReadBatch from one goroutine
 	// and Close from another, so readers take a snapshot via session() and
@@ -207,11 +166,10 @@ type adsCommInput struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	// Symbol metadata populated lazily after connect (from go-ads cache, no extra round-trips).
-	dataTypes   map[string]string
-	baseTypes   map[string]string
-	dataSizes   map[string]uint32
-	symbolNames map[string]string // strings.ToLower(name) → configured casing (TC2 returns uppercase)
+	// Symbol metadata for labelling messages, keyed by symbol name as
+	// configured. Filled from SubscribeResult in notification mode; filled
+	// lazily via Symbol() on first use in pull mode.
+	meta map[string]symbolMeta
 
 	loadSymbols bool
 	localMode   bool
@@ -277,10 +235,10 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		return nil, err
 	}
 
-	if err = validateIP(targetIP); err != nil {
-		return nil, fmt.Errorf("targetIP: %w", err)
+	if addr, perr := netip.ParseAddr(targetIP); perr != nil || !addr.Is4() {
+		return nil, fmt.Errorf("targetIP: %q is not a valid IPv4 address", targetIP)
 	}
-	if err = validateAMSNetID(targetAMS); err != nil {
+	if _, err = ams.ParseNetID(targetAMS); err != nil {
 		return nil, fmt.Errorf("targetAMS: %w", err)
 	}
 
@@ -302,7 +260,7 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		return nil, err
 	}
 	if hostAMS != "auto" && hostAMS != "" {
-		if err = validateAMSNetID(hostAMS); err != nil {
+		if _, err = ams.ParseNetID(hostAMS); err != nil {
 			return nil, fmt.Errorf("hostAMS: %w", err)
 		}
 	}
@@ -352,18 +310,9 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 	if err != nil {
 		return nil, err
 	}
-	var transmissionMode adsLib.TransMode
-	switch transmissionModeStr {
-	case "serverOnChange":
-		transmissionMode = adsLib.TransModeServerOnChange
-	case "serverCycle":
-		transmissionMode = adsLib.TransModeServerCycle
-	case "serverOnChange2":
-		transmissionMode = adsLib.TransModeServerOnChange2
-	case "serverCycle2":
-		transmissionMode = adsLib.TransModeServerCycle2
-	default:
-		transmissionMode = adsLib.TransModeServerOnChange
+	var transmissionMode ams.TransMode
+	if err = transmissionMode.UnmarshalText([]byte(transmissionModeStr)); err != nil {
+		return nil, fmt.Errorf("transmissionMode: %w", err)
 	}
 
 	routeUsername, err := conf.FieldString("routeUsername")
@@ -389,12 +338,6 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 	localMode, err := conf.FieldBool("localMode")
 	if err != nil {
 		return nil, err
-	}
-
-	// Derive hostAMS from routeHostAddress when set to "auto",
-	// matching the same convenience shortcut as the integrated plugin.
-	if hostAMS == "auto" && routeHostAddress != "" {
-		hostAMS = routeHostAddress + ".1.1"
 	}
 
 	symbolList := createSymbolList(symbols, cycleTime, maxDelay)
@@ -474,67 +417,53 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 
 	g.log.Infof("Creating new connection")
 
-	var connOpts []adsLib.SessionOption
+	var connOpts []adsLib.Option
 	if g.adsLogger != nil {
 		connOpts = append(connOpts, adsLib.WithLogger(g.adsLogger))
-		adsLib.SetDefaultLogger(g.adsLogger)
 	}
 	if g.localMode {
 		connOpts = append(connOpts, adsLib.WithLocalMode())
 	}
 
 	if g.routeUsername != "" && g.routePassword != "" {
-		hostAddr := g.routeHostAddress
-		if hostAddr == "" {
-			// Use TCP connect to guarantee same source IP as the actual ADS connection.
-			tcpConn, dialErr := net.DialTimeout("tcp4", net.JoinHostPort(g.targetIP, "48898"), 3*time.Second)
-			if dialErr != nil {
-				// PLC unreachable — fall back to UDP routing lookup (no packet sent).
-				udpConn, udpErr := net.Dial("udp4", net.JoinHostPort(g.targetIP, "48899"))
-				if udpErr != nil {
-					g.log.Errorf("Failed to auto-detect local address: %v", dialErr)
-					return dialErr
-				}
-				hostAddr = udpConn.LocalAddr().(*net.UDPAddr).IP.String()
-				udpConn.Close()
-			} else {
-				hostAddr = tcpConn.LocalAddr().(*net.TCPAddr).IP.String()
-				tcpConn.Close()
-			}
+		// An empty route name makes go-ads name the route after the callback
+		// IP itself (its own outbound source IP, or routeHostAddress below).
+		g.log.Infof("Route will be registered on PLC %s", g.targetIP)
+		connOpts = append(connOpts, adsLib.WithRoute("", g.routeUsername, g.routePassword))
+		if g.routeHostAddress != "" {
+			connOpts = append(connOpts, adsLib.WithHostIP(g.routeHostAddress))
 		}
-		if isLikelyContainerIP(hostAddr) {
-			g.log.Warnf("Auto-detected IP %s looks like a container IP. Set routeHostAddress to the Docker host's IP for route registration to work.", hostAddr)
-		}
-		routeName := fmt.Sprintf("bento-ads-%s", hostAddr)
-		g.log.Infof("Route will be registered on PLC %s: name=%s, clientIP=%s", g.targetIP, routeName, hostAddr)
-		connOpts = append(connOpts, adsLib.WithRoute(routeName, g.routeUsername, g.routePassword))
-		connOpts = append(connOpts, adsLib.WithHostIP(hostAddr))
 	}
 
-	targetAMS, err := adsLib.NewAMSAddress(g.targetAMS, uint16(g.runtimePort))
+	target, err := ams.NewAddress(g.targetAMS, ams.Port(g.runtimePort))
 	if err != nil {
 		g.log.Errorf("Invalid target AMS %q: %v", g.targetAMS, err)
 		return err
 	}
 
+	// The local Address is always set so hostPort takes effect; NetID stays
+	// zero (go-ads then derives it from the outbound TCP source IP) unless
+	// hostAMS was explicitly configured.
+	local := ams.Address{Port: ams.Port(g.hostPort)}
 	if g.hostAMS != "" && g.hostAMS != "auto" {
-		localAMS, lerr := adsLib.NewAMSAddress(g.hostAMS, uint16(g.hostPort))
-		if lerr != nil {
-			g.log.Errorf("Invalid local AMS %q: %v", g.hostAMS, lerr)
-			return lerr
+		local, err = ams.NewAddress(g.hostAMS, ams.Port(g.hostPort))
+		if err != nil {
+			g.log.Errorf("Invalid local AMS %q: %v", g.hostAMS, err)
+			return err
 		}
-		connOpts = append(connOpts, adsLib.WithLocalAMS(localAMS))
 	}
+	connOpts = append(connOpts, adsLib.WithLocalAddress(local))
+
 	if g.requestTimeout > 0 {
 		connOpts = append(connOpts, adsLib.WithRequestTimeout(g.requestTimeout))
 	}
 
 	// Use Background ctx for session lifetime — Bento passes a per-call ctx to Connect
 	// that would tear the session down as soon as Connect returns. Teardown is driven by Close().
-	sess, err := adsLib.NewSession(context.Background(), adsLib.AMSEndpoint{
-		IP:   g.targetIP,
-		Port: g.targetPort,
-		AMS:  targetAMS,
+	sess, err := adsLib.NewSession(context.Background(), adsLib.Endpoint{
+		Host:   g.targetIP,
+		Port:   g.targetPort,
+		Target: target,
 	}, connOpts...)
 	if err != nil {
 		g.log.Errorf("Failed to create session: %v", err)
@@ -554,13 +483,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		return err
 	}
 
-	g.symbolNames = make(map[string]string, len(g.symbols))
-	g.dataTypes = make(map[string]string, len(g.symbols))
-	g.baseTypes = make(map[string]string, len(g.symbols))
-	g.dataSizes = make(map[string]uint32, len(g.symbols))
-	for _, sym := range g.symbols {
-		g.symbolNames[strings.ToLower(sym.name)] = sym.name
-	}
+	g.meta = make(map[string]symbolMeta, len(g.symbols))
 
 	if g.loadSymbols {
 		g.log.Infof("Loading symbol and datatype table from PLC (loadSymbols=true)")
@@ -575,46 +498,34 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		configs := make([]adsLib.NotificationConfig, len(g.symbols))
 		for i, symbol := range g.symbols {
 			configs[i] = adsLib.NotificationConfig{
-				SymbolName:       symbol.name,
-				MaxDelay:         symbol.maxDelay,
-				CycleTime:        symbol.cycleTime,
-				TransmissionMode: g.transmissionMode,
+				Symbol:    symbol.name,
+				MaxDelay:  symbol.maxDelay,
+				CycleTime: symbol.cycleTime,
+				Mode:      g.transmissionMode,
 			}
 		}
 
-		results, err := sess.AddSymbolNotifications(ctx, configs, g.notificationChan)
+		results, err := sess.SubscribeAll(ctx, configs, g.notificationChan)
 		if err != nil {
-			g.log.Errorf("Batch add notifications failed: %v", err)
+			g.log.Errorf("Batch subscribe failed: %v", err)
 			return err
 		}
 
+		// The result carries each symbol's metadata alongside the outcome, so
+		// no follow-up Symbol() round-trip is needed to label its messages.
 		registered := 0
 		for i, r := range results {
-			switch {
-			case r.Skipped == nil && r.Error == adsLib.ReturnCodeNoErrors:
-				registered++
-			case r.Skipped != nil:
-				g.log.Errorf("Notification symbol %q skipped (check symbol name): %v", configs[i].SymbolName, r.Skipped)
-			default:
-				g.log.Errorf("Notification symbol %q rejected by PLC: ADS error 0x%X", configs[i].SymbolName, uint32(r.Error))
+			if r.Err != nil {
+				g.log.Errorf("Notification symbol %q failed: %v", configs[i].Symbol, r.Err)
+				continue
 			}
+			registered++
+			g.meta[configs[i].Symbol] = symbolMetaFrom(r.Symbol)
 		}
 		if registered == 0 && len(configs) > 0 {
 			return fmt.Errorf("no symbols registered for notifications (%d symbols all failed to resolve)", len(configs))
 		}
 		g.log.Infof("Registered %d/%d notification symbols", registered, len(configs))
-
-		// Populate metadata cache — symbols are in go-ads cache after AddSymbolNotifications.
-		for _, sym := range g.symbols {
-			key := strings.ToLower(sym.name)
-			if view, viewErr := sess.GetSymbol(ctx, sym.name); viewErr == nil {
-				g.dataTypes[key] = view.DataType
-				g.dataSizes[key] = view.Length
-				if bt := view.BaseTypeName(); bt != "" {
-					g.baseTypes[key] = bt
-				}
-			}
-		}
 
 		// TwinCAT sends each symbol's current value on subscribe; it stays in the
 		// channel and becomes the first ReadBatch, so the pipeline starts from the
@@ -637,22 +548,15 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 // Bento's types as structured content, and the symbol's name and type as
 // metadata.
 func (g *adsCommInput) makeMessage(symbol string, value any) *service.Message {
-	key := strings.ToLower(symbol)
-	name := symbol
-	if configured, ok := g.symbolNames[key]; ok {
-		name = configured // TC2 reports names in upper case
-	}
 	msg := service.NewMessage(nil)
 	msg.SetStructuredMut(toBento(value))
-	msg.MetaSet("symbol_name", sanitize(name))
-	if dt, ok := g.dataTypes[key]; ok {
-		msg.MetaSet("data_type", dt)
-	}
-	if bt, ok := g.baseTypes[key]; ok {
-		msg.MetaSet("base_type", bt)
-	}
-	if sz, ok := g.dataSizes[key]; ok {
-		msg.MetaSet("data_size", strconv.FormatUint(uint64(sz), 10))
+	msg.MetaSet("symbol_name", sanitize(symbol))
+	if m, ok := g.meta[symbol]; ok {
+		msg.MetaSet("data_type", m.dataType)
+		msg.MetaSet("data_size", strconv.FormatUint(uint64(m.size), 10))
+		if m.baseType != "" {
+			msg.MetaSet("base_type", m.baseType)
+		}
 	}
 	return msg
 }
@@ -684,9 +588,12 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		if g.closed() {
 			return nil, nil, service.ErrEndOfInput
 		}
-		if sess.IsClosed() {
+		select {
+		case <-sess.Done():
+			g.log.Warnf("Session ended: %v", sess.Err())
 			g.dropSession(sess)
 			return nil, nil, service.ErrNotConnected
+		default:
 		}
 		g.log.Warnf("Batch read failed (will retry): %v", err)
 		select {
@@ -697,16 +604,12 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		return service.MessageBatch{}, func(_ context.Context, _ error) error { return nil }, nil
 	}
 
-	// Lazily populate type metadata from go-ads cache (no extra round-trips).
+	// Lazily populate type metadata on first use (a single-symbol lookup, no
+	// extra round-trip once cached).
 	for _, sym := range g.symbols {
-		key := strings.ToLower(sym.name)
-		if _, ok := g.dataTypes[key]; !ok {
-			if view, viewErr := sess.GetSymbol(ctx, sym.name); viewErr == nil {
-				g.dataTypes[key] = view.DataType
-				g.dataSizes[key] = view.Length
-				if bt := view.BaseTypeName(); bt != "" {
-					g.baseTypes[key] = bt
-				}
+		if _, ok := g.meta[sym.name]; !ok {
+			if view, viewErr := sess.Symbol(ctx, sym.name); viewErr == nil {
+				g.meta[sym.name] = symbolMetaFrom(view)
 			}
 		}
 	}
@@ -735,6 +638,13 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	// A nil session's Done channel is nil and never fires.
+	sess := g.session()
+	var sessDone <-chan struct{}
+	if sess != nil {
+		sessDone = sess.Done()
+	}
+
 	var first *adsLib.Update
 	select {
 	case first = <-g.notificationChan:
@@ -744,22 +654,22 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 		}
 	case <-g.done:
 		return nil, nil, service.ErrEndOfInput
+	case <-sessDone:
+		g.log.Warnf("Session ended: %v", sess.Err())
+		g.dropSession(sess)
+		return nil, nil, service.ErrNotConnected
 	case <-waitCtx.Done():
-		if sess := g.session(); sess != nil && sess.IsClosed() {
-			g.dropSession(sess)
-			return nil, nil, service.ErrNotConnected
-		}
 		return nil, func(_ context.Context, _ error) error { return nil }, nil
 	}
 
-	msgs := service.MessageBatch{g.makeMessage(first.Variable, first.Value)}
+	msgs := service.MessageBatch{g.makeMessage(first.Symbol, first.Value)}
 
 	// Drain all pending notifications without blocking to keep the channel buffer available.
 	for {
 		select {
 		case update := <-g.notificationChan:
 			if update != nil {
-				msgs = append(msgs, g.makeMessage(update.Variable, update.Value))
+				msgs = append(msgs, g.makeMessage(update.Symbol, update.Value))
 			}
 		default:
 			return msgs, func(_ context.Context, _ error) error { return nil }, nil
