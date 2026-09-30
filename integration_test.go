@@ -165,6 +165,7 @@ func newIntegrationInput(t *testing.T, e plcEnv, readType string, extra string, 
 type sample struct {
 	value                        any
 	dataType, baseType, dataSize string
+	rangeMin, rangeMax           string
 }
 
 // collect reads batches until every symbol has been seen with accept()
@@ -196,6 +197,8 @@ func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name 
 			s.dataType, _ = msg.MetaGet("data_type")
 			s.baseType, _ = msg.MetaGet("base_type")
 			s.dataSize, _ = msg.MetaGet("data_size")
+			s.rangeMin, _ = msg.MetaGet("range_min")
+			s.rangeMax, _ = msg.MetaGet("range_max")
 			got[name] = s
 		}
 		if ack != nil {
@@ -248,9 +251,24 @@ var scalarCases = []scalarCase{
 	{"sStringVar", "STRING", 256, func(s uint32) any { return "S=" + strconv.FormatUint(uint64(s), 10) }},
 }
 
+// nSubRangeCase covers Main.fbTypeTest.nSubRange, an INT(-10..10) subrange.
+// It is top-level-only -- unlike every scalarCases entry, it is not a member
+// of ST_TypeTestStruct -- so it is tracked separately rather than folded into
+// scalarCases, which would break TestIntegrationStruct's per-field struct
+// check.
+var nSubRangeCase = scalarCase{"nSubRange", "INT", 2, func(s uint32) any { return int16(int32(s%21) - 10) }}
+
+// nSubRangeMin/nSubRangeMax are nSubRange's declared bounds, expected as
+// go-ads's recovered range_min/range_max metadata.
+var nSubRangeMin, nSubRangeMax = ptrTo(int64(-10)), ptrTo(int64(10))
+
+// topLevelCases is every top-level scalar under fbTypeTest: scalarCases (also
+// shared with the struct-field check) plus nSubRangeCase.
+var topLevelCases = append(append([]scalarCase{}, scalarCases...), nSubRangeCase)
+
 func scalarSymbols() []string {
-	out := make([]string, len(scalarCases))
-	for k, c := range scalarCases {
+	out := make([]string, len(topLevelCases))
+	for k, c := range topLevelCases {
 		out[k] = fb + c.field
 	}
 	return out
@@ -260,9 +278,19 @@ func scalarSymbols() []string {
 // seconds and milliseconds, and the top of UDINT.
 var seeds = []uint32{0, 1, 200, 40000, 100_001, 90_061_001, 4_000_000_000}
 
+// wantRangeMeta gives the expected range_min/range_max metadata strings for
+// field, or "" for a field with no declared subrange (every field except
+// nSubRange).
+func wantRangeMeta(field string) (min, max string) {
+	if field != "nSubRange" {
+		return "", ""
+	}
+	return strconv.FormatInt(*nSubRangeMin, 10), strconv.FormatInt(*nSubRangeMax, 10)
+}
+
 func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 	t.Helper()
-	for _, c := range scalarCases {
+	for _, c := range topLevelCases {
 		s, ok := got[sanitize(fb+c.field)]
 		if !ok {
 			t.Errorf("%s: no message", c.field)
@@ -279,6 +307,10 @@ func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 		}
 		if s.baseType == "" {
 			t.Errorf("%s: base_type missing", c.field)
+		}
+		wantMin, wantMax := wantRangeMeta(c.field)
+		if s.rangeMin != wantMin || s.rangeMax != wantMax {
+			t.Errorf("%s: range_min/range_max = %q/%q, want %q/%q", c.field, s.rangeMin, s.rangeMax, wantMin, wantMax)
 		}
 	}
 }
@@ -313,7 +345,7 @@ func TestIntegrationScalarsNotification(t *testing.T) {
 	const seed = 100_002
 	setSeed(t, ctl, seed)
 	got := collect(t, in, symbols, func(name string, v any) bool {
-		for _, c := range scalarCases {
+		for _, c := range topLevelCases {
 			if sanitize(fb+c.field) == name {
 				return reflect.DeepEqual(v, toBento(c.value(seed)))
 			}

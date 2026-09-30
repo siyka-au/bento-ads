@@ -93,11 +93,18 @@ type symbolMeta struct {
 	dataType string
 	baseType string
 	size     uint32
+	// rangeMin/rangeMax are an IEC 61131-3 subrange's declared bounds (e.g.
+	// INT(-10..10)), both nil for a symbol with no subrange restriction. 0 is
+	// a legitimate bound, so presence is signaled by non-nil.
+	rangeMin, rangeMax *int64
 }
 
 // symbolMetaFrom extracts the fields makeMessage needs from a SymbolView.
 func symbolMetaFrom(v adsLib.SymbolView) symbolMeta {
-	return symbolMeta{dataType: v.DataType, baseType: v.BaseTypeName(), size: v.Length}
+	return symbolMeta{
+		dataType: v.DataType, baseType: v.BaseTypeName(), size: v.Length,
+		rangeMin: v.RangeMin, rangeMax: v.RangeMax,
+	}
 }
 
 func sanitize(s string) string {
@@ -556,6 +563,12 @@ func (g *adsCommInput) makeMessage(symbol string, value any) *service.Message {
 		msg.MetaSet("data_size", strconv.FormatUint(uint64(m.size), 10))
 		if m.baseType != "" {
 			msg.MetaSet("base_type", m.baseType)
+		}
+		if m.rangeMin != nil {
+			msg.MetaSet("range_min", strconv.FormatInt(*m.rangeMin, 10))
+		}
+		if m.rangeMax != nil {
+			msg.MetaSet("range_max", strconv.FormatInt(*m.rangeMax, 10))
 		}
 	}
 	return msg

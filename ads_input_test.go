@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	adsLib "github.com/siyka-au/go-ads/v3"
 	"github.com/siyka-au/go-ads/v3/ams"
 	"github.com/warpstreamlabs/bento/public/service"
 )
@@ -173,4 +174,46 @@ func TestConcurrentClose(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+func TestSymbolMetaFrom_Range(t *testing.T) {
+	t.Run("with range", func(t *testing.T) {
+		m := symbolMetaFrom(adsLib.SymbolView{DataType: "INT", Length: 2, RangeMin: ptrTo(int64(-10)), RangeMax: ptrTo(int64(10))})
+		if m.rangeMin == nil || m.rangeMax == nil || *m.rangeMin != -10 || *m.rangeMax != 10 {
+			t.Errorf("rangeMin/rangeMax = %v/%v, want -10/10", m.rangeMin, m.rangeMax)
+		}
+	})
+	t.Run("without range", func(t *testing.T) {
+		m := symbolMetaFrom(adsLib.SymbolView{DataType: "INT", Length: 2})
+		if m.rangeMin != nil || m.rangeMax != nil {
+			t.Errorf("rangeMin/rangeMax = %v/%v, want nil/nil", m.rangeMin, m.rangeMax)
+		}
+	})
+}
+
+func TestMakeMessage_RangeMetadataOnlyWhenPresent(t *testing.T) {
+	in := parseTestInput(t, minimalConfig)
+
+	t.Run("with range", func(t *testing.T) {
+		in.meta = map[string]symbolMeta{"MAIN.x": {dataType: "INT", size: 2, rangeMin: ptrTo(int64(-10)), rangeMax: ptrTo(int64(10))}}
+		msg := in.makeMessage("MAIN.x", int16(5))
+		if v, ok := msg.MetaGet("range_min"); !ok || v != "-10" {
+			t.Errorf("range_min = %q, %v, want \"-10\", true", v, ok)
+		}
+		if v, ok := msg.MetaGet("range_max"); !ok || v != "10" {
+			t.Errorf("range_max = %q, %v, want \"10\", true", v, ok)
+		}
+	})
+	t.Run("without range", func(t *testing.T) {
+		in.meta = map[string]symbolMeta{"MAIN.x": {dataType: "INT", size: 2}}
+		msg := in.makeMessage("MAIN.x", int16(5))
+		if _, ok := msg.MetaGet("range_min"); ok {
+			t.Error("range_min present, want absent for a symbol with no declared subrange")
+		}
+		if _, ok := msg.MetaGet("range_max"); ok {
+			t.Error("range_max present, want absent for a symbol with no declared subrange")
+		}
+	})
 }
