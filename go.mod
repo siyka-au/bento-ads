@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	cloud.google.com/go v0.123.0
-	github.com/siyka-au/go-ads/v3 v3.0.0
+	github.com/siyka-au/go-ads/v3 v3.0.1
 	github.com/warpstreamlabs/bento v1.21.2
 )
 
