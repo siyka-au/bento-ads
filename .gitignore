@@ -3,4 +3,7 @@
 /dist/
 
 # Local PLC connection settings; copy .env.example to .env.
-.env
+.env*
+!.env.example
+example/config*.yaml
+!example/config.yaml

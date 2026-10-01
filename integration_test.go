@@ -1,7 +1,8 @@
 package bentoads
 
-// Integration tests against the AdsGo_Testing PLC project
-// (siyka/ads-go/plc/testing). Every output of Main.fbTypeTest is a
+// Integration tests against the AdsClient_DeterministicTester PLC project,
+// part of the AdsClient_Tester TwinCAT solution
+// (https://github.com/siyka-au/ads-client-tester). Every output of Main.fbTypeTest is a
 // deterministic function of nSeed, so each test writes a seed and checks the
 // messages the ads input emits: their structured content against the Go value
 // the PLC holds, converted as toBento converts it, and their metadata.

@@ -27,8 +27,9 @@ go test .                          # unit tests, no PLC needed
 go test -run Integration -v .      # against a PLC, using .env
 ```
 
-The integration tests expect the AdsGo_Testing PLC project
-(`siyka/ads-go/plc/testing`) and are skipped when `ADS_TARGET_NET_ID` is unset.
+The integration tests expect the `AdsClient_DeterministicTester` PLC project,
+part of the [ads-client-tester](https://github.com/siyka-au/ads-client-tester)
+TwinCAT solution, and are skipped when `ADS_TARGET_NET_ID` is unset.
 
 `cmd/bento-ads` bundles every standard Bento component plus the `ads` input. To add
 the input to your own Bento build, blank-import the package:

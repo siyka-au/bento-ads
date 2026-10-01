@@ -1,5 +1,6 @@
-# Reads the AdsGo_Testing PLC project (siyka/ads-go/plc/testing), whose
-# outputs are all derived from Main.fbTypeTest.nSeed.
+# Reads the AdsClient_DeterministicTester PLC project
+# (https://github.com/siyka-au/ads-client-tester), whose outputs are all
+# derived from Main.fbTypeTest.nSeed.
 #   bento-ads -e .env -c example/testing-plc.yaml
 input:
   ads:
