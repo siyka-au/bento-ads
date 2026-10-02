@@ -20,6 +20,36 @@ The example configs read the connection from `ADS_TARGET_IP`, `ADS_TARGET_NET_ID
 `ADS_TARGET_PORT` and `ADS_LOCAL_MODE`. `.env` is gitignored, so machine-specific
 values stay out of the repo.
 
+## Running as a service
+
+`bento-ads` can install and manage itself as an OS service, via
+[kardianos/service](https://github.com/kardianos/service): a real Windows
+service, a systemd/Upstart/SysV/OpenRC service on Linux, or a FreeBSD rc.d
+service -- not a third-party wrapper, so stopping it runs Bento's own
+graceful shutdown rather than a hard kill. OpenBSD and NetBSD aren't
+supported by the underlying library.
+
+```sh
+bento-ads service install -c C:\path\to\config.yaml -e C:\path\to\.env
+bento-ads service start
+bento-ads service stop
+bento-ads service restart
+bento-ads service uninstall
+```
+
+`-c`/`-e` are only needed (and only read) at `install` time -- they're
+resolved to absolute paths and baked into the service definition, since the
+OS starts the service from a working directory you don't control. The other
+actions just operate on the already-installed service.
+
+Installing a service generally needs elevated privileges (an Administrator
+shell on Windows, `sudo` on Linux/FreeBSD).
+
+Running `bento-ads` directly -- interactively, or as the entrypoint of a
+container -- is unaffected and behaves exactly as in [Build](#build) above;
+the service machinery only activates for the `service` subcommand and when
+actually launched by the OS service manager.
+
 ## Tests
 
 ```sh
