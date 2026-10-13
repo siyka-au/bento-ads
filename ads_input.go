@@ -203,7 +203,9 @@ var adsConf = service.NewConfigSpec().
 	Field(service.NewIntField("maxDelay").Description("Max delay time after value change before PLC should send message, in milliseconds.").Default(100)).
 	Field(service.NewIntField("cycleTime").Description("Requested read interval for PLC to scan for changes (notification mode), in milliseconds.").Default(1000)).
 	Field(service.NewIntField("intervalTime").Description("Interval between reads in milliseconds for interval read type.").Default(1000)).
-	Field(service.NewStringField("logLevel").Description("Log level for ADS connection. Default disabled.").Default("disabled")).
+	Field(service.NewStringField("logLevel").Description("go-ads log level: trace, debug, info, warn, error, or disabled. " +
+		"disabled drops everything, including reconnect failures, the PLC leaving RUN and heartbeat loss, so it is " +
+		"rarely what you want; records are also subject to Bento's own logger.level.").Default("warn")).
 	Field(service.NewIntField("requestTimeout").Description("Timeout for individual ADS requests in milliseconds.").Default(5000)).
 	Field(service.NewStringField("transmissionMode").Description("Notification transmission mode: serverOnChange (default), serverCycle, serverOnChange2, serverCycle2.").Default("serverOnChange")).
 	Field(service.NewStringField("routeUsername").Description("Username for UDP route registration on the PLC. If set with routePassword, a route will be registered before connecting.").Default("")).

@@ -54,6 +54,25 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+// logLevel defaults to warn (not disabled) so go-ads errors such as reconnect
+// failures reach Bento's logger by default.
+func TestConfigDefaults_LogLevel(t *testing.T) {
+	in := parseTestInput(t, minimalConfig)
+	if !in.adsLogger.Enabled(context.Background(), slog.LevelWarn) {
+		t.Error("default logLevel does not enable warn records")
+	}
+	if in.adsLogger.Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("default logLevel enables info records, want warn and above only")
+	}
+}
+
+func TestConfigLogLevel_DisabledStillAccepted(t *testing.T) {
+	in := parseTestInput(t, minimalConfig+"logLevel: disabled\n")
+	if in.adsLogger.Enabled(context.Background(), slog.LevelError) {
+		t.Error("logLevel: disabled still enables error records")
+	}
+}
+
 func TestConfigTransmissionModes(t *testing.T) {
 	for name, want := range map[string]ams.TransMode{
 		"serverOnChange":  ams.TransModeServerOnChange,

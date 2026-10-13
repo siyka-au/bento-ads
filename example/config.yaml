@@ -11,7 +11,7 @@ input:
     maxDelay: 100
     cycleTime: 100
     intervalTime: 1000
-    logLevel: 'disabled'      # trace, debug, info, warn, error
+    logLevel: 'warn'          # trace, debug, info, warn, error, disabled
     symbols:
       - 'MAIN.MYBOOL'
       - 'MAIN.MYTRIGGER:0:10' # name:maxDelayMs:cycleTimeMs
