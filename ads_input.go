@@ -187,6 +187,12 @@ type adsCommInput struct {
 	routeHostAddress string
 
 	adsLogger *slog.Logger
+
+	// disconnects/reconnects count go-ads's own WithOnDisconnect/WithOnReconnect
+	// callbacks. go-ads already logs both events itself (via adsLogger above),
+	// so these add metrics only, no extra log lines.
+	disconnects *service.MetricCounter
+	reconnects  *service.MetricCounter
 }
 
 var adsConf = service.NewConfigSpec().
@@ -373,6 +379,8 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		routePassword:    routePassword,
 		routeHostAddress: routeHostAddress,
 		adsLogger:        adsLogger,
+		disconnects:      mgr.Metrics().NewCounter("ads_disconnects"),
+		reconnects:       mgr.Metrics().NewCounter("ads_reconnects"),
 	}
 
 	return m, nil
@@ -416,6 +424,13 @@ func (g *adsCommInput) closed() bool {
 	}
 }
 
+// onADSDisconnect and onADSReconnect back go-ads's WithOnDisconnect/
+// WithOnReconnect: go-ads invokes them from its own goroutine and they must
+// not block, which Incr satisfies (counters count only; go-ads already logs
+// both events itself via adsLogger).
+func (g *adsCommInput) onADSDisconnect() { g.disconnects.Incr(1) }
+func (g *adsCommInput) onADSReconnect()  { g.reconnects.Incr(1) }
+
 func (g *adsCommInput) Connect(ctx context.Context) error {
 	if g.closed() {
 		return service.ErrEndOfInput
@@ -430,6 +445,14 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 	if g.adsLogger != nil {
 		connOpts = append(connOpts, adsLib.WithLogger(g.adsLogger))
 	}
+	// Registered once per Session below; go-ads calls these from its own
+	// goroutine on every disconnect/reconnect for that Session's lifetime
+	// (including internal reconnects), so this is not re-registered per
+	// reconnect.
+	connOpts = append(connOpts,
+		adsLib.WithOnDisconnect(g.onADSDisconnect),
+		adsLib.WithOnReconnect(g.onADSReconnect),
+	)
 	if g.localMode {
 		connOpts = append(connOpts, adsLib.WithLocalMode())
 	}

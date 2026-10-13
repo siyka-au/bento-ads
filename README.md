@@ -96,6 +96,19 @@ See `example/config.yaml`. The fields are:
 | `logLevel` | `warn` | go-ads log level: `trace`, `debug`, `info`, `warn`, `error`, `disabled`. `disabled` drops everything, including reconnect failures, the PLC leaving RUN and heartbeat loss; records are also subject to Bento's own `logger.level` |
 | `symbols` | | `MAIN.var` or `MAIN.var:maxDelayMs:cycleTimeMs` |
 
+## Metrics
+
+Alongside Bento's own component metrics (`input_ads`, `input_latency_ns`, ...),
+the `ads` input emits:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `ads_disconnects` | counter | Incremented each time go-ads detects the TCP connection has dropped |
+| `ads_reconnects` | counter | Incremented each time go-ads successfully reconnects after a drop |
+
+go-ads already logs both events itself (subject to `logLevel`), so these add
+counts only, not duplicate log lines.
+
 ## Messages
 
 Each message is one symbol's value as structured content, with metadata

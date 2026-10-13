@@ -195,6 +195,29 @@ func TestConcurrentClose(t *testing.T) {
 	wg.Wait()
 }
 
+// onADSDisconnect/onADSReconnect back go-ads's WithOnDisconnect/WithOnReconnect
+// callbacks, which must never block. There is no PLC here to drive an actual
+// disconnect/reconnect, and the public service.Metrics API exposes no way to
+// read a counter back, so this only checks the wiring itself: the methods
+// exist on the input, are safe to call directly (nil-safe counters, no
+// panics), and return immediately.
+func TestADSDisconnectReconnectCallbacks_DoNotBlock(t *testing.T) {
+	in := parseTestInput(t, minimalConfig)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		in.onADSDisconnect()
+		in.onADSReconnect()
+		in.onADSDisconnect()
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("onADSDisconnect/onADSReconnect blocked")
+	}
+}
+
 func ptrTo[T any](v T) *T { return &v }
 
 func TestSymbolMetaFrom_Range(t *testing.T) {
