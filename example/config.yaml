@@ -23,7 +23,7 @@ pipeline:
         root = {
           meta("symbol_name"): this,
           "data_type": meta("data_type"),
-          "timestamp_ms": (timestamp_unix_nano() / 1000000).floor()
+          "timestamp": meta("timestamp")
         }
 
 output:

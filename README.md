@@ -99,7 +99,11 @@ See `example/config.yaml`. The fields are:
 ## Messages
 
 Each message is one symbol's value as structured content, with metadata
-`symbol_name`, `data_type` (as TwinCAT reports it), `base_type` and `data_size`.
+`symbol_name`, `data_type` (as TwinCAT reports it), `base_type`, `data_size` and
+`timestamp`. `timestamp` is when the value was sampled, as RFC 3339 with
+nanoseconds: the PLC's own time for notifications, and the start of the read for
+interval reads. It is metadata, so the body is unchanged. To put it in the
+payload, map it in the pipeline, e.g. `root.timestamp = meta("timestamp")`.
 
 go-ads returns values as Go types; the input converts them to Bento's own types
 and does no further formatting:

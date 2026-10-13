@@ -552,12 +552,13 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 }
 
 // makeMessage builds the message for one symbol's value: the value converted to
-// Bento's types as structured content, and the symbol's name and type as
-// metadata.
-func (g *adsCommInput) makeMessage(symbol string, value any) *service.Message {
+// Bento's types as structured content, the symbol's name and type as metadata,
+// and ts (when the value was sampled) as the RFC 3339 "timestamp" metadata.
+func (g *adsCommInput) makeMessage(symbol string, value any, ts time.Time) *service.Message {
 	msg := service.NewMessage(nil)
 	msg.SetStructuredMut(toBento(value))
 	msg.MetaSet("symbol_name", sanitize(symbol))
+	msg.MetaSet("timestamp", ts.Format(time.RFC3339Nano))
 	if m, ok := g.meta[symbol]; ok {
 		msg.MetaSet("data_type", m.dataType)
 		msg.MetaSet("data_size", strconv.FormatUint(uint64(m.size), 10))
@@ -630,7 +631,7 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 	msgs := make(service.MessageBatch, 0, len(values))
 	for _, symbol := range g.symbols {
 		if val, ok := values[symbol.name]; ok {
-			msgs = append(msgs, g.makeMessage(symbol.name, val))
+			msgs = append(msgs, g.makeMessage(symbol.name, val, start))
 		}
 	}
 
@@ -675,14 +676,14 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 		return nil, func(_ context.Context, _ error) error { return nil }, nil
 	}
 
-	msgs := service.MessageBatch{g.makeMessage(first.Symbol, first.Value)}
+	msgs := service.MessageBatch{g.makeMessage(first.Symbol, first.Value, first.Time)}
 
 	// Drain all pending notifications without blocking to keep the channel buffer available.
 	for {
 		select {
 		case update := <-g.notificationChan:
 			if update != nil {
-				msgs = append(msgs, g.makeMessage(update.Symbol, update.Value))
+				msgs = append(msgs, g.makeMessage(update.Symbol, update.Value, update.Time))
 			}
 		default:
 			return msgs, func(_ context.Context, _ error) error { return nil }, nil

@@ -165,6 +165,7 @@ func newIntegrationInput(t *testing.T, e plcEnv, readType string, extra string, 
 
 type sample struct {
 	value                        any
+	timestamp                    time.Time
 	dataType, baseType, dataSize string
 	rangeMin, rangeMax           string
 }
@@ -195,6 +196,13 @@ func collect(t *testing.T, in *adsCommInput, symbols []string, accept func(name 
 				continue
 			}
 			s := sample{value: v}
+			ts, ok := msg.MetaGet("timestamp")
+			if !ok {
+				t.Fatalf("%s: timestamp metadata absent", name)
+			}
+			if s.timestamp, err = time.Parse(time.RFC3339Nano, ts); err != nil {
+				t.Fatalf("%s: timestamp %q is not RFC 3339: %v", name, ts, err)
+			}
 			s.dataType, _ = msg.MetaGet("data_type")
 			s.baseType, _ = msg.MetaGet("base_type")
 			s.dataSize, _ = msg.MetaGet("data_size")

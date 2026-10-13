@@ -193,12 +193,32 @@ func TestSymbolMetaFrom_Range(t *testing.T) {
 	})
 }
 
+// makeMessage must carry the sample time as an RFC 3339 "timestamp" metadata
+// key, so the body stays unchanged and the pipeline can map it.
+func TestMakeMessage_TimestampMetadata(t *testing.T) {
+	in := parseTestInput(t, minimalConfig)
+	sampled := time.Date(2026, 10, 5, 12, 0, 0, 123456789, time.UTC)
+
+	msg := in.makeMessage("MAIN.x", int16(5), sampled)
+	v, ok := msg.MetaGet("timestamp")
+	if !ok {
+		t.Fatal("timestamp metadata absent")
+	}
+	got, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		t.Fatalf("timestamp %q is not RFC 3339: %v", v, err)
+	}
+	if !got.Equal(sampled) {
+		t.Errorf("timestamp = %v, want %v", got, sampled)
+	}
+}
+
 func TestMakeMessage_RangeMetadataOnlyWhenPresent(t *testing.T) {
 	in := parseTestInput(t, minimalConfig)
 
 	t.Run("with range", func(t *testing.T) {
 		in.meta = map[string]symbolMeta{"MAIN.x": {dataType: "INT", size: 2, rangeMin: ptrTo(int64(-10)), rangeMax: ptrTo(int64(10))}}
-		msg := in.makeMessage("MAIN.x", int16(5))
+		msg := in.makeMessage("MAIN.x", int16(5), time.Time{})
 		if v, ok := msg.MetaGet("range_min"); !ok || v != "-10" {
 			t.Errorf("range_min = %q, %v, want \"-10\", true", v, ok)
 		}
@@ -208,7 +228,7 @@ func TestMakeMessage_RangeMetadataOnlyWhenPresent(t *testing.T) {
 	})
 	t.Run("without range", func(t *testing.T) {
 		in.meta = map[string]symbolMeta{"MAIN.x": {dataType: "INT", size: 2}}
-		msg := in.makeMessage("MAIN.x", int16(5))
+		msg := in.makeMessage("MAIN.x", int16(5), time.Time{})
 		if _, ok := msg.MetaGet("range_min"); ok {
 			t.Error("range_min present, want absent for a symbol with no declared subrange")
 		}
