@@ -11,8 +11,136 @@ import (
 
 	adsLib "github.com/siyka-au/go-ads/v3"
 	"github.com/siyka-au/go-ads/v3/ams"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/warpstreamlabs/bento/public/service"
 )
+
+// newTestTracer returns a tracer backed by an in-memory SpanRecorder, for
+// asserting on ads.read's name, attributes and status without a PLC.
+func newTestTracer() (trace.Tracer, *tracetest.SpanRecorder) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	return tp.Tracer("test"), sr
+}
+
+func attrsOf(t *testing.T, span sdktrace.ReadOnlySpan) map[string]any {
+	t.Helper()
+	m := make(map[string]any, len(span.Attributes()))
+	for _, kv := range span.Attributes() {
+		m[string(kv.Key)] = kv.Value.AsInterface()
+	}
+	return m
+}
+
+func TestADSReadSpan_Success(t *testing.T) {
+	tracer, sr := newTestTracer()
+	_, span := startADSReadSpan(context.Background(), tracer, "1.2.3.4.1.1", "1.2.3.4", 851, 3)
+	finishADSReadSpan(span, 3, nil)
+
+	ended := sr.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("got %d ended spans, want 1", len(ended))
+	}
+	got := ended[0]
+	if got.Name() != "ads.read" {
+		t.Errorf("span name = %q, want ads.read", got.Name())
+	}
+
+	attrs := attrsOf(t, got)
+	want := map[string]any{
+		"ads.target.ams_net_id": "1.2.3.4.1.1",
+		"ads.target.ip":         "1.2.3.4",
+		"ads.target.port":       int64(851),
+		"ads.symbols.requested": int64(3),
+		"ads.symbols.returned":  int64(3),
+	}
+	for k, wantV := range want {
+		if attrs[k] != wantV {
+			t.Errorf("attribute %s = %v, want %v", k, attrs[k], wantV)
+		}
+	}
+	if got.Status().Code != codes.Unset {
+		t.Errorf("status = %v, want Unset", got.Status().Code)
+	}
+
+	// Messages built from this read attach a background context carrying the
+	// span, per ReadBatchPull -- check that context round-trips the
+	// SpanContext and that the span is no longer recording, which is what lets
+	// Bento's InitSpan start input_ads as ads.read's child instead of reusing it.
+	msgCtx := trace.ContextWithSpan(context.Background(), span)
+	fromMsg := trace.SpanFromContext(msgCtx)
+	wantSC := span.SpanContext()
+	gotSC := fromMsg.SpanContext()
+	if gotSC.TraceID() != wantSC.TraceID() || gotSC.SpanID() != wantSC.SpanID() {
+		t.Error("message context does not carry the read span's SpanContext")
+	}
+	if fromMsg.IsRecording() {
+		t.Error("span is still recording after finishADSReadSpan, want ended")
+	}
+}
+
+func TestADSReadSpan_FatalErrorNoValues(t *testing.T) {
+	tracer, sr := newTestTracer()
+	_, span := startADSReadSpan(context.Background(), tracer, "1.2.3.4.1.1", "1.2.3.4", 851, 2)
+	readErr := errors.New("transport failure")
+	finishADSReadSpan(span, 0, readErr)
+
+	got := sr.Ended()[0]
+	if got.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error", got.Status().Code)
+	}
+	if got.Status().Description != readErr.Error() {
+		t.Errorf("status description = %q, want %q", got.Status().Description, readErr.Error())
+	}
+	if len(got.Events()) == 0 {
+		t.Error("RecordError did not add an event to the span")
+	}
+}
+
+// A partial BatchError with some values still returned must be recorded on
+// the span but must not fail its status -- some data beats none.
+func TestADSReadSpan_PartialBatchErrorStillReturnsStatusOK(t *testing.T) {
+	tracer, sr := newTestTracer()
+	_, span := startADSReadSpan(context.Background(), tracer, "1.2.3.4.1.1", "1.2.3.4", 851, 3)
+	batchErr := &adsLib.BatchError{
+		Op: "read", Requested: 3, Succeeded: 2,
+		Items: []adsLib.BatchItemError{{Symbol: "MAIN.x"}},
+	}
+	finishADSReadSpan(span, 2, batchErr)
+
+	got := sr.Ended()[0]
+	if got.Status().Code == codes.Error {
+		t.Error("partial batch with some values returned marked the span failed, want Unset")
+	}
+	if len(got.Events()) == 0 {
+		t.Error("partial batch error was not recorded on the span")
+	}
+	attrs := attrsOf(t, got)
+	if attrs["ads.symbols.failed"] != int64(1) {
+		t.Errorf("ads.symbols.failed = %v, want 1", attrs["ads.symbols.failed"])
+	}
+}
+
+// A BatchError where nothing came back at all must fail the span: all data
+// is missing, so this is indistinguishable from a wholly failed read.
+func TestADSReadSpan_BatchErrorNoValuesReturnedFailsSpan(t *testing.T) {
+	tracer, sr := newTestTracer()
+	_, span := startADSReadSpan(context.Background(), tracer, "1.2.3.4.1.1", "1.2.3.4", 851, 2)
+	batchErr := &adsLib.BatchError{
+		Op: "read", Requested: 2, Succeeded: 0,
+		Items: []adsLib.BatchItemError{{Symbol: "MAIN.x"}, {Symbol: "MAIN.y"}},
+	}
+	finishADSReadSpan(span, 0, batchErr)
+
+	got := sr.Ended()[0]
+	if got.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error", got.Status().Code)
+	}
+}
 
 func parseTestInput(t *testing.T, yaml string) *adsCommInput {
 	t.Helper()

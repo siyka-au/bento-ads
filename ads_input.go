@@ -17,8 +17,16 @@ import (
 
 	adsLib "github.com/siyka-au/go-ads/v3"
 	"github.com/siyka-au/go-ads/v3/ams"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/warpstreamlabs/bento/public/service"
 )
+
+// tracerName identifies this plugin as the instrumentation source of the
+// ads.read span, as OpenTelemetry's Tracer(name) expects.
+const tracerName = "github.com/siyka-au/bento-ads"
 
 // bentoLogHandler bridges go-ads's slog-based logging into Bento's logging infrastructure.
 type bentoLogHandler struct {
@@ -193,6 +201,11 @@ type adsCommInput struct {
 	// so these add metrics only, no extra log lines.
 	disconnects *service.MetricCounter
 	reconnects  *service.MetricCounter
+
+	// tracer and readLatency instrument the PLC read itself (interval mode
+	// only); see ReadBatchPull.
+	tracer      trace.Tracer
+	readLatency *service.MetricTimer
 }
 
 var adsConf = service.NewConfigSpec().
@@ -381,6 +394,8 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		adsLogger:        adsLogger,
 		disconnects:      mgr.Metrics().NewCounter("ads_disconnects"),
 		reconnects:       mgr.Metrics().NewCounter("ads_reconnects"),
+		tracer:           mgr.OtelTracer().Tracer(tracerName),
+		readLatency:      mgr.Metrics().NewTimer("ads_read_latency_ns"),
 	}
 
 	return m, nil
@@ -600,6 +615,40 @@ func (g *adsCommInput) makeMessage(symbol string, value any, ts time.Time) *serv
 	return msg
 }
 
+// startADSReadSpan starts the "ads.read" span for one PLC round trip, tagged
+// with its target and request size. The returned context carries the span and
+// should be passed to the read call itself.
+func startADSReadSpan(ctx context.Context, tracer trace.Tracer, targetAMS, targetIP string, runtimePort, requested int) (context.Context, trace.Span) {
+	return tracer.Start(ctx, "ads.read", trace.WithAttributes(
+		attribute.String("ads.target.ams_net_id", targetAMS),
+		attribute.String("ads.target.ip", targetIP),
+		attribute.Int("ads.target.port", runtimePort),
+		attribute.Int("ads.symbols.requested", requested),
+	))
+}
+
+// finishADSReadSpan records a read's outcome and ends the span. err is nil on
+// full success or a *adsLib.BatchError on a partial batch (see ReadValues);
+// any other error means the read as a whole failed. A partial batch is
+// recorded as an error on the span but only fails its status when nothing
+// came back at all -- some data beats none.
+func finishADSReadSpan(span trace.Span, returned int, err error) {
+	defer span.End()
+	span.SetAttributes(attribute.Int("ads.symbols.returned", returned))
+	if err == nil {
+		return
+	}
+	span.RecordError(err)
+	var batchErr *adsLib.BatchError
+	if errors.As(err, &batchErr) {
+		span.SetAttributes(attribute.Int("ads.symbols.failed", len(batchErr.Items)))
+		if returned > 0 {
+			return
+		}
+	}
+	span.SetStatus(codes.Error, err.Error())
+}
+
 func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	g.log.Debugf("ReadBatchPull called")
 	start := time.Now()
@@ -613,9 +662,20 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		names[i] = symbol.name
 	}
 
+	// ads.read times and traces the PLC round trip itself; Bento's own
+	// input_ads span and input_latency_ns timer start only once ReadBatch
+	// returns, so on their own they measure read-to-acknowledge, not the read.
+	readCtx, span := startADSReadSpan(ctx, g.tracer, g.targetAMS, g.targetIP, g.runtimePort, len(names))
+	readStart := time.Now()
+	values, err := sess.ReadValues(readCtx, names)
+	g.readLatency.Timing(time.Since(readStart).Nanoseconds())
+	// Span ends here, before any message is built from this read, so Bento's
+	// InitSpan sees a non-recording span on the messages' context below and
+	// creates input_ads as ads.read's child rather than reusing it.
+	finishADSReadSpan(span, len(values), err)
+
 	// A *BatchError names the symbols that failed and leaves the rest in values;
 	// any other error means the read as a whole failed.
-	values, err := sess.ReadValues(ctx, names)
 	var batchErr *adsLib.BatchError
 	switch {
 	case err == nil:
@@ -653,10 +713,14 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		}
 	}
 
+	// A background context, not ctx, so a message's context does not inherit
+	// ReadBatchPull's own cancellation once ReadBatch has returned.
+	spanCtx := trace.ContextWithSpan(context.Background(), span)
 	msgs := make(service.MessageBatch, 0, len(values))
 	for _, symbol := range g.symbols {
 		if val, ok := values[symbol.name]; ok {
-			msgs = append(msgs, g.makeMessage(symbol.name, val, start))
+			msg := g.makeMessage(symbol.name, val, start)
+			msgs = append(msgs, msg.WithContext(spanCtx))
 		}
 	}
 
@@ -670,6 +734,9 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 	return msgs, func(_ context.Context, _ error) error { return nil }, nil
 }
 
+// ReadBatchNotification has no PLC request to time or trace: it only drains
+// updates the PLC already pushed to notificationChan, so it gets no ads.read
+// span (see ReadBatchPull, interval mode, for that).
 func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	g.log.Debugf("ReadBatchNotification called")
 

@@ -105,9 +105,34 @@ the `ads` input emits:
 |---|---|---|
 | `ads_disconnects` | counter | Incremented each time go-ads detects the TCP connection has dropped |
 | `ads_reconnects` | counter | Incremented each time go-ads successfully reconnects after a drop |
+| `ads_read_latency_ns` | timer | The PLC round trip for one interval read (`readType: interval`), in nanoseconds -- just the read, unlike `input_latency_ns`'s read-to-acknowledge |
 
-go-ads already logs both events itself (subject to `logLevel`), so these add
-counts only, not duplicate log lines.
+go-ads already logs the disconnect/reconnect events itself (subject to
+`logLevel`), so the counters above add counts only, not duplicate log lines.
+
+### Tracing
+
+In `interval` mode, each PLC read gets its own `ads.read` span, started before
+the read and ended as soon as it returns -- before Bento's own `input_ads`
+span exists, so `input_ads` is created as `ads.read`'s child (one trace per
+read: `ads.read` -> `input_ads` -> processors -> output). `notification` mode
+has no discrete request to time or trace, so it gets no `ads.read` span.
+
+`ads.read`'s attributes:
+
+| Attribute | Meaning |
+|---|---|
+| `ads.target.ams_net_id` | `targetAMS` |
+| `ads.target.ip` | `targetIP` |
+| `ads.target.port` | `runtimePort` |
+| `ads.symbols.requested` | Number of symbols asked for |
+| `ads.symbols.returned` | Number of symbols that came back with a value |
+| `ads.symbols.failed` | Only set on a partial batch error: number of symbols that failed |
+
+A partial batch error (some symbols failed, others still returned a value) is
+recorded on the span but does not mark it failed -- some data beats none. The
+span is only marked failed when the read fails outright, or a batch error
+leaves no symbols with a value at all.
 
 ## Messages
 
