@@ -101,14 +101,59 @@ See `example/config.yaml`. The fields are:
 Alongside Bento's own component metrics (`input_ads`, `input_latency_ns`, ...),
 the `ads` input emits:
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `ads_disconnects` | counter | Incremented each time go-ads detects the TCP connection has dropped |
-| `ads_reconnects` | counter | Incremented each time go-ads successfully reconnects after a drop |
-| `ads_read_latency_ns` | timer | The PLC round trip for one interval read (`readType: interval`), in nanoseconds -- just the read, unlike `input_latency_ns`'s read-to-acknowledge |
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `ads_disconnects` | counter | | Incremented each time go-ads detects the TCP connection has dropped |
+| `ads_reconnects` | counter | | Incremented each time go-ads successfully reconnects after a drop |
+| `ads_connected` | gauge | | `1` while the transport is up (since `Connect` or the last reconnect), `0` after a disconnect or `Close`. A direct "is it down right now" signal, where the two counters above only say how often it has changed |
+| `ads_reconnect_failures` | counter | | Incremented after each reconnect-loop iteration that fails (go-ads's `WithOnReconnectAttempt`). The attempt deferred only because the PLC runtime is not in RUN yet does not count, matching go-ads not charging it against the attempt budget either |
+| `ads_reads` | counter | `result` = `ok`\|`partial`\|`error` | One increment per interval read (`readType: interval`). `partial` is a `*adsLib.BatchError` (the PLC answered per-item and at least one item failed); `error` is everything else, including a transport failure such as a router rejection or a timed-out `SumRead` |
+| `ads_read_errors` | counter | `reason` = `timeout`\|`router`\|`device`\|`canceled`\|`other` | Only incremented alongside `ads_reads{result="error"}`; classifies *why*. See [Read error classification](#read-error-classification) below |
+| `ads_symbols_failed` | counter | | Number of symbols named in a partial batch's failed items (`ads_reads{result="partial"}`) |
+| `ads_last_read_success` | gauge | | Unix seconds of the last read (`interval` mode) or drained notification (`notification` mode) that produced at least one value. A staleness alert (see below) is the main reason this exists |
+| `ads_read_latency_ns` | timer | | The PLC round trip for one interval read (`readType: interval`), in nanoseconds -- just the read, unlike `input_latency_ns`'s read-to-acknowledge |
 
-go-ads already logs the disconnect/reconnect events itself (subject to
-`logLevel`), so the counters above add counts only, not duplicate log lines.
+go-ads already logs the disconnect/reconnect/reconnect-attempt events itself
+(subject to `logLevel`), so the metrics above add counts and gauges only, not
+duplicate log lines.
+
+With the fork's OTel metrics exporter, a counter named `ads_foo` above appears
+in Prometheus as `ads_foo_total`.
+
+Example alert expressions:
+
+```promql
+# No data at all for 30s, in either read mode.
+time() - ads_last_read_success > 30
+
+# The transport is down right now.
+ads_connected == 0
+
+# Reads are failing at more than 0 per second, broken down by cause.
+sum by (reason) (rate(ads_read_errors_total[5m])) > 0
+```
+
+### Read error classification
+
+`ads_read_errors`'s `reason` label is deliberately a small, fixed set so the
+metric's cardinality never grows and a dashboard built against it never needs
+to change. `classifyReadError` (in `ads_metrics.go`) maps the error
+`ReadBatchPull` got from `ReadValues` using `errors.Is`/`errors.As` against
+go-ads/`ams` error types, never by matching message text:
+
+| `reason` | Matches |
+|---|---|
+| `timeout` | `context.DeadlineExceeded`, or an ADS-level timeout return code (`ams.ReturnCodeDeviceTimeout`, `ReturnCodeClientSyncTimeout`, `ReturnCodeWsaeTimedOut`) |
+| `router` | `ams.RouterError` -- a rejection from the AMS router itself, never a per-item PLC verdict. This is the incident that motivated this metric: `SumRead failed: context deadline exceeded` followed by `AMS router: 0x001A: TCP send error`, with go-ads never declaring a disconnect |
+| `device` | Any other `ams.ReturnCode` -- the PLC answered with a per-item ADS error |
+| `canceled` | `context.Canceled` (e.g. shutdown) |
+| `other` | Everything else, including go-ads's own `ErrDisconnected`/`ErrTransportClosed`/`ErrRuntimeNotRunning` |
+
+`ams.RouterError` is checked before any `ams.ReturnCode` check: go-ads's own
+`RouterError.Is` deliberately does not unwrap to `ReturnCode`, precisely so a
+router-level rejection is never read as a verdict about the symbols requested
+-- a `RouterError` is classified `router` however it is wrapped, regardless of
+which code it happens to carry.
 
 ### Tracing
 

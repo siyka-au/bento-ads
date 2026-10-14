@@ -338,11 +338,12 @@ func TestADSDisconnectReconnectCallbacks_DoNotBlock(t *testing.T) {
 		in.onADSDisconnect()
 		in.onADSReconnect()
 		in.onADSDisconnect()
+		in.onADSReconnectAttempt(1, errors.New("dial failed"))
 	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("onADSDisconnect/onADSReconnect blocked")
+		t.Fatal("onADSDisconnect/onADSReconnect/onADSReconnectAttempt blocked")
 	}
 }
 

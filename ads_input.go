@@ -202,6 +202,28 @@ type adsCommInput struct {
 	disconnects *service.MetricCounter
 	reconnects  *service.MetricCounter
 
+	// adsConnected is the current transport state (1 connected, 0 not), as
+	// opposed to disconnects/reconnects above which count the transitions.
+	// "ads_connected == 0" is a direct alerting condition; a counter alone
+	// cannot express "down right now".
+	adsConnected *service.MetricGauge
+
+	// reconnectFailures counts go-ads's WithOnReconnectAttempt callback: a
+	// reconnect-loop iteration that failed (err != nil). The incident this was
+	// added for saw repeated SumRead timeouts with no disconnect ever declared,
+	// so this and the read metrics below are what would have moved instead.
+	reconnectFailures *service.MetricCounter
+
+	// reads/readErrors/symbolsFailed instrument ReadBatchPull (readType:
+	// interval) only -- notification mode has no discrete PLC read to count.
+	// lastReadSuccess is also updated from ReadBatchNotification: it is a
+	// data-liveness signal ("is anything still arriving"), not a read-outcome
+	// counter, so it applies to both modes.
+	reads           *service.MetricCounter
+	readErrors      *service.MetricCounter
+	symbolsFailed   *service.MetricCounter
+	lastReadSuccess *service.MetricGauge
+
 	// tracer and readLatency instrument the PLC read itself (interval mode
 	// only); see ReadBatchPull.
 	tracer      trace.Tracer
@@ -396,6 +418,22 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		reconnects:       mgr.Metrics().NewCounter("ads_reconnects"),
 		tracer:           mgr.OtelTracer().Tracer(tracerName),
 		readLatency:      mgr.Metrics().NewTimer("ads_read_latency_ns"),
+
+		adsConnected:      mgr.Metrics().NewGauge("ads_connected"),
+		reconnectFailures: mgr.Metrics().NewCounter("ads_reconnect_failures"),
+		reads:             mgr.Metrics().NewCounter("ads_reads", "result"),
+		readErrors:        mgr.Metrics().NewCounter("ads_read_errors", "reason"),
+		symbolsFailed:     mgr.Metrics().NewCounter("ads_symbols_failed"),
+		lastReadSuccess:   mgr.Metrics().NewGauge("ads_last_read_success"),
+	}
+
+	// Initialise every label series at zero so increase() can see the first
+	// real increment instead of treating it as the series' birth.
+	for _, result := range []string{readResultOK, readResultPartial, readResultError} {
+		m.reads.Incr(0, result)
+	}
+	for _, reason := range allReadErrorReasons {
+		m.readErrors.Incr(0, reason)
 	}
 
 	return m, nil
@@ -441,10 +479,23 @@ func (g *adsCommInput) closed() bool {
 
 // onADSDisconnect and onADSReconnect back go-ads's WithOnDisconnect/
 // WithOnReconnect: go-ads invokes them from its own goroutine and they must
-// not block, which Incr satisfies (counters count only; go-ads already logs
-// both events itself via adsLogger).
-func (g *adsCommInput) onADSDisconnect() { g.disconnects.Incr(1) }
-func (g *adsCommInput) onADSReconnect()  { g.reconnects.Incr(1) }
+// not block, which Incr/Set satisfy (go-ads already logs both events itself
+// via adsLogger).
+func (g *adsCommInput) onADSDisconnect() {
+	g.disconnects.Incr(1)
+	g.adsConnected.Set(0)
+}
+func (g *adsCommInput) onADSReconnect() {
+	g.reconnects.Incr(1)
+	g.adsConnected.Set(1)
+}
+
+// onADSReconnectAttempt backs go-ads's WithOnReconnectAttempt: one call per
+// reconnect-loop iteration that failed. Unlike onADSReconnect above, this is
+// not a transition the FSM settles into, so it does not touch adsConnected.
+func (g *adsCommInput) onADSReconnectAttempt(_ int, _ error) {
+	g.reconnectFailures.Incr(1)
+}
 
 func (g *adsCommInput) Connect(ctx context.Context) error {
 	if g.closed() {
@@ -467,6 +518,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 	connOpts = append(connOpts,
 		adsLib.WithOnDisconnect(g.onADSDisconnect),
 		adsLib.WithOnReconnect(g.onADSReconnect),
+		adsLib.WithOnReconnectAttempt(g.onADSReconnectAttempt),
 	)
 	if g.localMode {
 		connOpts = append(connOpts, adsLib.WithLocalMode())
@@ -529,6 +581,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		g.log.Errorf("Failed to connect to PLC at %s: %v", g.targetIP, err)
 		return err
 	}
+	g.adsConnected.Set(1)
 
 	g.meta = make(map[string]symbolMeta, len(g.symbols))
 
@@ -679,11 +732,16 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 	var batchErr *adsLib.BatchError
 	switch {
 	case err == nil:
+		g.reads.Incr(1, readResultOK)
 	case errors.As(err, &batchErr):
+		g.reads.Incr(1, readResultPartial)
+		g.symbolsFailed.Incr(int64(len(batchErr.Items)))
 		for _, item := range batchErr.Items {
 			g.log.Warnf("Read failed: %v", item)
 		}
 	default:
+		g.reads.Incr(1, readResultError)
+		g.readErrors.Incr(1, classifyReadError(err))
 		if g.closed() {
 			return nil, nil, service.ErrEndOfInput
 		}
@@ -701,6 +759,9 @@ func (g *adsCommInput) ReadBatchPull(ctx context.Context) (service.MessageBatch,
 		case <-time.After(100 * time.Millisecond):
 		}
 		return service.MessageBatch{}, func(_ context.Context, _ error) error { return nil }, nil
+	}
+	if len(values) > 0 {
+		g.lastReadSuccess.Set(time.Now().Unix())
 	}
 
 	// Lazily populate type metadata on first use (a single-symbol lookup, no
@@ -769,6 +830,10 @@ func (g *adsCommInput) ReadBatchNotification(ctx context.Context) (service.Messa
 	}
 
 	msgs := service.MessageBatch{g.makeMessage(first.Symbol, first.Value, first.Time)}
+	// lastReadSuccess is a data-liveness signal, not a ReadBatchPull-only metric
+	// (see the field's doc comment): a notification session that has gone
+	// silent should trip the same staleness alert as a stalled interval read.
+	g.lastReadSuccess.Set(time.Now().Unix())
 
 	// Drain all pending notifications without blocking to keep the channel buffer available.
 	for {
@@ -797,6 +862,7 @@ func (g *adsCommInput) ReadBatch(ctx context.Context) (service.MessageBatch, ser
 func (g *adsCommInput) Close(ctx context.Context) error {
 	g.log.Debugf("Close called")
 	g.closeOnce.Do(func() { close(g.done) })
+	g.adsConnected.Set(0)
 
 	g.mu.Lock()
 	sess := g.handler
