@@ -457,6 +457,14 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 	for _, reason := range allReadErrorReasons {
 		m.readErrors.Incr(0, reason)
 	}
+	// Unlabelled counters only get a series on their first Incr too, and these
+	// are the ones alerts watch (disconnects, reconnect failures, drops).
+	for _, c := range []*service.MetricCounter{
+		m.disconnects, m.reconnects, m.reconnectFailures, m.symbolsFailed,
+		m.symbolVersionChanges, m.notificationsDropped, m.heartbeatSilences,
+	} {
+		c.Incr(0)
+	}
 
 	return m, nil
 }
