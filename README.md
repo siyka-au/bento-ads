@@ -112,10 +112,16 @@ the `ads` input emits:
 | `ads_symbols_failed` | counter | | Number of symbols named in a partial batch's failed items (`ads_reads{result="partial"}`) |
 | `ads_last_read_success` | gauge | | Unix seconds of the last read (`interval` mode) or drained notification (`notification` mode) that produced at least one value. A staleness alert (see below) is the main reason this exists |
 | `ads_read_latency_ns` | timer | | The PLC round trip for one interval read (`readType: interval`), in nanoseconds -- just the read, unlike `input_latency_ns`'s read-to-acknowledge |
+| `ads_plc_running` | gauge | | `1` while the PLC runtime is known to be in RUN, `0` otherwise (including "not known yet") |
+| `ads_plc_state` | gauge | | The numeric `ams.State` last observed -- see [PLC runtime states](#plc-runtime-states) below for what each value means |
+| `ads_symbol_version_changes` | counter | | Incremented on each online-change detection (go-ads's `WithOnSymbolVersionChanged`) |
+| `ads_notifications_dropped` | counter | | Incremented each time a notification is dropped because this plugin's channel was full (go-ads's `WithOnNotificationDropped`). No per-symbol label -- see the field's doc comment in `ads_input.go` |
+| `ads_heartbeat_silences` | counter | | Incremented each time go-ads's internal subscription heartbeat (`notification` mode) goes silent long enough to be treated as evidence the subscriptions died (go-ads's `WithOnHeartbeatSilent`) |
 
-go-ads already logs the disconnect/reconnect/reconnect-attempt events itself
-(subject to `logLevel`), so the metrics above add counts and gauges only, not
-duplicate log lines.
+go-ads already logs the disconnect/reconnect/reconnect-attempt/runtime-state/
+symbol-version/notification-dropped/heartbeat-silent events itself (subject to
+`logLevel`), so the metrics above add counts and gauges only, not duplicate
+log lines.
 
 With the fork's OTel metrics exporter, a counter named `ads_foo` above appears
 in Prometheus as `ads_foo_total`.
@@ -131,6 +137,9 @@ ads_connected == 0
 
 # Reads are failing at more than 0 per second, broken down by cause.
 sum by (reason) (rate(ads_read_errors_total[5m])) > 0
+
+# The PLC itself has left RUN (CONFIG, STOP, a restart, ...).
+ads_plc_running == 0
 ```
 
 ### Read error classification
@@ -154,6 +163,29 @@ go-ads/`ams` error types, never by matching message text:
 router-level rejection is never read as a verdict about the symbols requested
 -- a `RouterError` is classified `router` however it is wrapped, regardless of
 which code it happens to carry.
+
+### PLC runtime states
+
+`ads_plc_state`'s value is go-ads' `ams.State`, the device's own ADS state
+code (from `ams/state.go`):
+
+| Value | State | Value | State |
+|---|---|---|---|
+| 0 | Invalid (not known yet) | 9 | PowerFailure |
+| 1 | Idle | 10 | PowerGood |
+| 2 | Reset | 11 | Error |
+| 3 | Init | 12 | Shutdown |
+| 4 | Start | 13 | Suspend |
+| 5 | Run | 14 | Resume |
+| 6 | Stop | 15 | Config |
+| 7 | SaveCfg | 16 | Reconfig |
+| 8 | LoadCfg | 255 | MaxStates |
+
+Only `Run` (5) counts as "running" for `ads_plc_running`. `Config` (15) and
+`Reconfig` (16) are the two states go-ads itself treats as provably not
+serving a runtime port; everything else (including `Stop`) is permitted
+rather than refused, since go-ads has only measured those two in the field --
+see go-ads' `runtimeDefinitelyNotServing`.
 
 ### Tracing
 

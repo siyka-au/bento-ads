@@ -95,6 +95,28 @@ func TestClassifyReadError_RouterPrecedesReturnCode(t *testing.T) {
 	}
 }
 
+// TestPlcRunningValue pins the one state that counts as "running": only
+// ams.StateRun, nothing else -- including states adjacent to it in the
+// enumeration and the zero/invalid value.
+func TestPlcRunningValue(t *testing.T) {
+	tests := []struct {
+		state ams.State
+		want  int64
+	}{
+		{ams.StateRun, 1},
+		{ams.StateConfig, 0},
+		{ams.StateStop, 0},
+		{ams.StateInvalid, 0},
+		{ams.StateIdle, 0},
+		{ams.State(250), 0},
+	}
+	for _, tc := range tests {
+		if got := plcRunningValue(tc.state); got != tc.want {
+			t.Errorf("plcRunningValue(%v) = %d, want %d", tc.state, got, tc.want)
+		}
+	}
+}
+
 // TestAllReadErrorReasons_CoversWhatClassifyReturns guards against the two
 // lists silently diverging: every value classifyReadError can produce must be
 // in the initialisation list, or that reason's series would never exist at

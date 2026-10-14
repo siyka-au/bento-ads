@@ -347,6 +347,30 @@ func TestADSDisconnectReconnectCallbacks_DoNotBlock(t *testing.T) {
 	}
 }
 
+// TestADSHealthCallbacks_DoNotBlock is TestADSDisconnectReconnectCallbacks_DoNotBlock
+// for the Step 3 callbacks: PLC and notification health has the same
+// constraints (go-ads calls these from its own goroutine) and the same lack
+// of a way to read a metric back through the public service.Metrics API, so
+// this checks the wiring only.
+func TestADSHealthCallbacks_DoNotBlock(t *testing.T) {
+	in := parseTestInput(t, minimalConfig)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		in.onADSRuntimeStateChange(ams.StateRun, ams.StateConfig)
+		in.onADSSymbolVersionChanged(adsLib.ReasonSymbolVersionInvalid)
+		in.onADSNotificationDropped("MAIN.x")
+		in.onADSHeartbeatSilent()
+		in.setPLCState(ams.StateRun)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a Step 3 health callback blocked")
+	}
+}
+
 func ptrTo[T any](v T) *T { return &v }
 
 func TestSymbolMetaFrom_Range(t *testing.T) {

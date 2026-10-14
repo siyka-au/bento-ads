@@ -72,3 +72,14 @@ func classifyReadError(err error) string {
 	}
 	return readErrorOther
 }
+
+// plcRunningValue is the ads_plc_running gauge's value for a given runtime
+// state: 1 only in ams.StateRun, 0 for everything else (CONFIG, STOP, an
+// unknown/unread state, ...). ads_plc_state carries the numeric state itself
+// for anyone who needs the detail.
+func plcRunningValue(state ams.State) int64 {
+	if state == ams.StateRun {
+		return 1
+	}
+	return 0
+}

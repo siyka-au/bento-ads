@@ -224,6 +224,22 @@ type adsCommInput struct {
 	symbolsFailed   *service.MetricCounter
 	lastReadSuccess *service.MetricGauge
 
+	// plcRunning/plcState track the PLC runtime state, set from Session.Info()
+	// right after Connect and kept current via go-ads's
+	// WithOnRuntimeStateChange. plcState is the numeric ams.State value --
+	// see the README's metrics table for what each number means.
+	plcRunning *service.MetricGauge
+	plcState   *service.MetricGauge
+
+	// symbolVersionChanges/notificationsDropped/heartbeatSilences back go-ads's
+	// WithOnSymbolVersionChanged/WithOnNotificationDropped/WithOnHeartbeatSilent.
+	// No symbol label on notificationsDropped: one series per symbol would grow
+	// with the configured symbol list, for a signal ("something is being
+	// dropped") that does not need per-symbol detail to act on.
+	symbolVersionChanges *service.MetricCounter
+	notificationsDropped *service.MetricCounter
+	heartbeatSilences    *service.MetricCounter
+
 	// tracer and readLatency instrument the PLC read itself (interval mode
 	// only); see ReadBatchPull.
 	tracer      trace.Tracer
@@ -425,6 +441,12 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		readErrors:        mgr.Metrics().NewCounter("ads_read_errors", "reason"),
 		symbolsFailed:     mgr.Metrics().NewCounter("ads_symbols_failed"),
 		lastReadSuccess:   mgr.Metrics().NewGauge("ads_last_read_success"),
+
+		plcRunning:           mgr.Metrics().NewGauge("ads_plc_running"),
+		plcState:             mgr.Metrics().NewGauge("ads_plc_state"),
+		symbolVersionChanges: mgr.Metrics().NewCounter("ads_symbol_version_changes"),
+		notificationsDropped: mgr.Metrics().NewCounter("ads_notifications_dropped"),
+		heartbeatSilences:    mgr.Metrics().NewCounter("ads_heartbeat_silences"),
 	}
 
 	// Initialise every label series at zero so increase() can see the first
@@ -497,6 +519,36 @@ func (g *adsCommInput) onADSReconnectAttempt(_ int, _ error) {
 	g.reconnectFailures.Incr(1)
 }
 
+// onADSRuntimeStateChange backs go-ads's WithOnRuntimeStateChange. from is
+// unused: the gauges only need where the PLC is now, not where it was.
+func (g *adsCommInput) onADSRuntimeStateChange(_, to ams.State) {
+	g.setPLCState(to)
+}
+
+// onADSSymbolVersionChanged backs go-ads's WithOnSymbolVersionChanged, fired
+// once per online-change detection (go-ads logs the event itself).
+func (g *adsCommInput) onADSSymbolVersionChanged(_ adsLib.Reason) {
+	g.symbolVersionChanges.Incr(1)
+}
+
+// onADSNotificationDropped backs go-ads's WithOnNotificationDropped. The
+// symbol name is deliberately not used as a label; see notificationsDropped's
+// doc comment.
+func (g *adsCommInput) onADSNotificationDropped(_ string) {
+	g.notificationsDropped.Incr(1)
+}
+
+// onADSHeartbeatSilent backs go-ads's WithOnHeartbeatSilent.
+func (g *adsCommInput) onADSHeartbeatSilent() {
+	g.heartbeatSilences.Incr(1)
+}
+
+// setPLCState sets both PLC-state gauges from one reading.
+func (g *adsCommInput) setPLCState(state ams.State) {
+	g.plcRunning.Set(plcRunningValue(state))
+	g.plcState.Set(int64(state))
+}
+
 func (g *adsCommInput) Connect(ctx context.Context) error {
 	if g.closed() {
 		return service.ErrEndOfInput
@@ -519,6 +571,10 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		adsLib.WithOnDisconnect(g.onADSDisconnect),
 		adsLib.WithOnReconnect(g.onADSReconnect),
 		adsLib.WithOnReconnectAttempt(g.onADSReconnectAttempt),
+		adsLib.WithOnRuntimeStateChange(g.onADSRuntimeStateChange),
+		adsLib.WithOnSymbolVersionChanged(g.onADSSymbolVersionChanged),
+		adsLib.WithOnNotificationDropped(g.onADSNotificationDropped),
+		adsLib.WithOnHeartbeatSilent(g.onADSHeartbeatSilent),
 	)
 	if g.localMode {
 		connOpts = append(connOpts, adsLib.WithLocalMode())
@@ -582,6 +638,9 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 		return err
 	}
 	g.adsConnected.Set(1)
+	if info := sess.Info(); info.RuntimeKnown {
+		g.setPLCState(info.Runtime)
+	}
 
 	g.meta = make(map[string]symbolMeta, len(g.symbols))
 
