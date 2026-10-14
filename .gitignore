@@ -1,5 +1,5 @@
 /bento-ads
-/bento-ads.exe
+/*.exe
 /dist/
 
 # Local PLC connection settings; copy .env.example to .env.
