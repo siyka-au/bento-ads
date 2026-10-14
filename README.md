@@ -129,8 +129,10 @@ in Prometheus as `ads_foo_total`.
 Example alert expressions:
 
 ```promql
-# No data at all for 30s, in either read mode.
-time() - ads_last_read_success > 30
+# No data for about two minutes, in either read mode. Metrics are pushed
+# periodically (push_interval, e.g. 60s), so this value lags by up to one
+# interval even when reads are healthy: keep the threshold above it.
+time() - ads_last_read_success > 120
 
 # The transport is down right now.
 ads_connected == 0
