@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,6 +128,97 @@ func TestProgramRunnerReturnsWithoutStopExitsCatchesBreakage(t *testing.T) {
 	if exitCalls[0] == 0 {
 		t.Fatalf("exit code = %d, want non-zero so the service manager records a failure", exitCalls[0])
 	}
+}
+
+// TestProgramLogsStartingWithConfigAndEnvPaths checks the lifecycle logging
+// added alongside the tee-gating fix: run must log a "starting" INFO line
+// to the OS logger directly (not through the tee), naming the -c/-e paths
+// it read off os.Args -- the same os.Args the service manager invokes the
+// process with (see parseConfigArgs in args.go).
+func TestProgramLogsStartingWithConfigAndEnvPaths(t *testing.T) {
+	origArgs := os.Args
+	os.Args = []string{"bento-ads", "-c", "/etc/bento-ads/config.yaml", "-e", "/etc/bento-ads/.env"}
+	defer func() { os.Args = origArgs }()
+
+	fake := &fakeOSLogger{}
+	// run logs "starting" BEFORE calling runCLI (see program.go), so
+	// waiting for this close guarantees that line has already been
+	// written -- without it, Stop (below) could race program.run's
+	// goroutine and run before "starting" is logged.
+	runCLIStarted := make(chan struct{})
+	p := &program{
+		runCLI: func(ctx context.Context, _ ...service.CLIOptFunc) {
+			close(runCLIStarted)
+			<-ctx.Done()
+		},
+		osLogger: fake,
+	}
+
+	if err := p.Start(nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-runCLIStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCLI was never called")
+	}
+	if err := p.Stop(nil); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	var startLine string
+	for _, line := range fake.infos {
+		if strings.Contains(line, "starting") {
+			startLine = line
+		}
+	}
+	if startLine == "" {
+		t.Fatalf("expected a \"starting\" INFO line, got %v", fake.infos)
+	}
+	if !strings.Contains(startLine, "/etc/bento-ads/config.yaml") || !strings.Contains(startLine, "/etc/bento-ads/.env") {
+		t.Fatalf("expected the starting line to name both the config and env paths; got %q", startLine)
+	}
+}
+
+// TestProgramLogsStoppingThenStopped checks that Stop logs "stopping"
+// (directly, as soon as it's called) and that run logs "stopped" only
+// afterwards, once runCLI has actually returned because of that Stop --
+// not the "stream ended without a stop" failure path, which is covered by
+// TestProgramRunnerReturnsWithoutStopExits above.
+func TestProgramLogsStoppingThenStopped(t *testing.T) {
+	fake := &fakeOSLogger{}
+	// Synchronize on runCLI being reached, same reasoning as in
+	// TestProgramLogsStartingWithConfigAndEnvPaths above: otherwise
+	// "starting" (run's goroutine) and "stopping" (Stop, called right
+	// after Start returns) could land in either order.
+	runCLIStarted := make(chan struct{})
+	p := &program{
+		runCLI: func(ctx context.Context, _ ...service.CLIOptFunc) {
+			close(runCLIStarted)
+			<-ctx.Done()
+		},
+		osLogger: fake,
+	}
+
+	if err := p.Start(nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-runCLIStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCLI was never called")
+	}
+	if err := p.Stop(nil); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// run also logs its own "starting" line first (covered by the test
+	// above), so check the last two entries rather than the whole slice.
+	if len(fake.infos) < 2 {
+		t.Fatalf("expected at least a \"stopping\" and a \"stopped\" line, got %v", fake.infos)
+	}
+	got := fake.infos[len(fake.infos)-2:]
+	assertEqualStrings(t, "infos", got, []string{"bento-ads: stopping", "bento-ads: stopped"})
 }
 
 // TestProgramStopBeforeRunnerReturnsNoFailure is the mirror case: when

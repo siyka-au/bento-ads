@@ -57,17 +57,35 @@ separate, narrower code path, so a config that relies on CLI-only sections
 (`telemetry_resources`, `error_handling`, `logger.file`, metrics/tracer
 resources, etc.) works identically whichever way `bento-ads` was started.
 
-Until Bento's own logger is up -- and, once it is, for everything it logs,
-in addition to wherever `logger` in the config sends it -- service-mode
-output goes to the OS's system log: the Windows Event Log (Application log,
-source `bento-ads`) on Windows, syslog/journald on Linux. This matters
-because a service manager discards a service's stdout/stderr, so without
-this there would be nowhere to see a config that fails to load, or any log
-line at all, from an installed service. A `DEBUG`-level line only reaches
-the system log once `logger.level` in the config is set to `DEBUG` (or
-`TRACE`, which the system log can't distinguish from `DEBUG`); everything
-else follows the same `logger.level` threshold as the config's own log
-sink.
+Service mode writes to the OS's system log -- the Windows Event Log
+(Application log, source `bento-ads`) on Windows, syslog/journald on Linux --
+but only what would otherwise be lost, since that log is shared with every
+other program on the machine and capped at a fixed size (20 MB by default on
+Windows); a chatty `DEBUG` config can fill that in well under an hour and
+evict everyone else's events with it. Specifically:
+
+* Anything that fails before Bento's own logger exists (a bad `-c`/`-e`
+  path, a config that fails to parse or lint, ...) always goes to the
+  system log, at `ERROR` -- a service manager discards stdout/stderr, so
+  without this a broken install would have nowhere to report to at all.
+* `bento-ads` itself logs its own service lifecycle directly to the system
+  log, a handful of lines per start/stop: starting (with the `-c`/`-e`
+  paths and build version), stopping, stopped, and a graceful-shutdown
+  timeout or an unrequested exit, both at `ERROR`.
+* Everything Bento's own configured `logger` emits is sent to the system
+  log too, filtered by `logger.level` as usual, but **only when the config
+  has no `logger.file` path set**. With `logger.file` configured, every one
+  of those records is already being kept on disk (and, in most setups,
+  shipped on to Grafana/Loki from there), so the system log doesn't need a
+  second copy -- it would only drown out everyone else's events. Without
+  `logger.file`, a service's stdout is discarded and nothing else keeps
+  those records, so they go to the system log instead. A `DEBUG`-level line
+  only reaches the system log once `logger.level` is `DEBUG` (or `TRACE`,
+  which the system log can't distinguish from `DEBUG`), same as always.
+
+Known gap: if `logger.file` is configured but fails at runtime (e.g. the
+disk fills up), that failure isn't detected or mirrored to the system log --
+the log file is assumed to work once it's configured.
 
 ## Tests
 

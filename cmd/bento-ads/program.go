@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -77,6 +79,19 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 		runCLI = service.RunCLI
 	}
 
+	// bento-ads's own service lifecycle, logged directly to the OS system
+	// logger rather than through osSlogHandler's tee -- this is a handful
+	// of lines per start, nowhere near the volume that motivated gating the
+	// tee below, and must appear whether or not a file logger ends up
+	// configured. os.Args here is the service manager's invocation
+	// ("-c <cfg> -e <env>", baked in at `service install` time); os.Args[0]
+	// is the executable path, not a flag, hence the [1:].
+	configPath, envPath := parseConfigArgs(os.Args[1:])
+	_ = p.osLogger.Info(fmt.Sprintf(
+		"bento-ads service starting (config=%q env=%q version=%s)",
+		configPath, envPath, buildVersion(),
+	))
+
 	errWriter := &osErrWriter{logger: p.osLogger}
 	osSlogHandler := newOSSlogHandler(p.osLogger)
 	osSlogLogger := slog.New(osSlogHandler)
@@ -90,6 +105,14 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 			if lvl, err := pConf.FieldString("logger", "level"); err == nil {
 				osSlogHandler.setLevel(parseLogLevel(lvl))
 			}
+			// A file logger (logger.file.path set) already keeps every
+			// record Bento's own logger emits on disk, so the tee to the
+			// OS log is only worth it when there isn't one -- see the
+			// design note on osSlogHandler in oslog.go. FieldString
+			// returns the env-interpolated value, same as the logger.level
+			// read above, so an interpolated path is still seen here.
+			filePath, _ := pConf.FieldString("logger", "file", "path")
+			osSlogHandler.decideFileLogger(filePath != "")
 			return nil
 		}),
 	)
@@ -99,11 +122,19 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 	// trigger graceful shutdown within shutdown_timeout).
 	runCLI(ctx, opts...)
 
+	// If the CLIOptOnConfigParse hook above never fired (e.g. the config
+	// failed to parse before OnManagerInitialised runs), no file logger was
+	// ever established, so any records buffered while waiting for the
+	// decision are the only record of what happened: flush them. A no-op
+	// if the hook already decided.
+	osSlogHandler.decideFileLogger(false)
+
 	p.mu.Lock()
 	stopRequested := p.stopRequested
 	p.mu.Unlock()
 
 	if stopRequested {
+		_ = p.osLogger.Info("bento-ads: stopped")
 		return
 	}
 
@@ -132,6 +163,8 @@ func (p *program) Stop(s kservice.Service) error {
 	done := p.done
 	p.mu.Unlock()
 
+	_ = p.osLogger.Info("bento-ads: stopping")
+
 	if cancel == nil {
 		// Start's goroutine hasn't set up its context yet.
 		return nil
@@ -147,4 +180,35 @@ func (p *program) Stop(s kservice.Service) error {
 		_ = p.osLogger.Error("bento-ads: graceful shutdown did not finish within stopTimeout")
 	}
 	return nil
+}
+
+// buildVersion returns a short build identifier for the "service starting"
+// log line: the running binary's VCS revision and build time, from the Go
+// module's embedded build info, mirroring how Bento stamps its own
+// cli.Version (internal/cli/run.go) -- that package is internal to the
+// bento module so isn't importable here, hence reading debug.BuildInfo
+// directly instead. Returns "unknown" when no VCS info was embedded (e.g. a
+// `go build` outside a git checkout); this is informational only, so a
+// vaguer string here has no other effect.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	var revision, buildTime string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.time":
+			buildTime = s.Value
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if buildTime != "" {
+		return revision + " (" + buildTime + ")"
+	}
+	return revision
 }

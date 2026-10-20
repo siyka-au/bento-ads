@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	kservice "github.com/kardianos/service"
@@ -52,10 +53,31 @@ func (w *osErrWriter) Write(p []byte) (int, error) {
 }
 
 // osSlogHandler is an slog.Handler that renders records onto a kservice
-// Logger, for use with service.CLIOptAddTeeLogger so that everything
-// Bento's own logger emits is *also* visible in the OS system log, which is
-// otherwise the only thing a Windows service's stderr/stdout-discarding
-// service manager leaves us.
+// Logger, for use with service.CLIOptAddTeeLogger.
+//
+// Bento's own log records are only worth sending to the OS system log (the
+// Windows Application log, shared with every other program, capped at a
+// fixed size) when they would otherwise be lost entirely: a service's
+// stdout/stderr is discarded, but a configured file logger (logger.file)
+// already keeps every record on disk, as does Grafana once it has shipped
+// there. So the tee is forwarded only when the parsed config has no file
+// logger -- see hasFileLogger below, decided once from a
+// CLIOptOnConfigParse hook (program.go) -- and, even then, only at or above
+// logger.level.
+//
+// Ordering, found by reading ../bento's internal/cli/common (CreateLogger /
+// RunService): CreateLogger builds Bento's logger and applies the tee
+// (CLIOptOnLoggerInit) BEFORE confReader's lints/config-summary lines are
+// logged and BEFORE OnManagerInitialised (CLIOptOnConfigParse) ever runs --
+// so a handful of real tee records (the config summary, lint warnings, ...)
+// always arrive before the file-logger decision is made. Those records are
+// buffered (state.buf, bounded by maxBufferedRecords) rather than dropped
+// or guessed at, and are flushed or discarded once decideFileLogger is
+// called. If RunCLI returns without that hook ever firing (e.g. the config
+// failed to parse before OnManagerInitialised), program.go calls
+// decideFileLogger(false) itself once RunCLI returns, since in that case no
+// file logger was ever established and the buffered records are the only
+// record of what happened.
 //
 // The tee receives every record regardless of logger.level -- Bento's own
 // configured logger does its own level filtering, but a tee branch gets
@@ -69,13 +91,44 @@ type osSlogHandler struct {
 	level  *atomic.Int64 // slog.Level, stored as int64
 	attrs  []slog.Attr
 	groups []string
+
+	// state is shared (by pointer) across every handler returned by
+	// WithAttrs/WithGroup, the same way level is: slog.Logger.With(...)
+	// clones the handler, and the buffer/decision must be the same one
+	// underneath every clone.
+	state *teeState
+}
+
+// maxBufferedRecords bounds how many pre-decision tee records osSlogHandler
+// holds onto; past this, the oldest is dropped (with a single logged note)
+// rather than growing without bound while waiting for the file-logger
+// decision.
+const maxBufferedRecords = 1000
+
+// bufferedRecord is a tee record captured before decideFileLogger has run,
+// already rendered to its final line (Handle does that work once; replaying
+// just re-dispatches it to the right kservice.Logger method).
+type bufferedRecord struct {
+	level slog.Level
+	line  string
+}
+
+// teeState is osSlogHandler's mutable, shared state: whether the
+// file-logger decision has been made yet, what it was, and the records
+// buffered while waiting for it.
+type teeState struct {
+	mu           sync.Mutex
+	decided      bool
+	forward      bool // meaningful only once decided: true if there is no file logger
+	buf          []bufferedRecord
+	droppedNoted bool
 }
 
 // newOSSlogHandler builds an osSlogHandler defaulting to slog.LevelInfo
 // until setLevel is called (normally from a CLIOptOnConfigParse hook, once
 // logger.level has actually been read from the config).
 func newOSSlogHandler(logger kservice.Logger) *osSlogHandler {
-	h := &osSlogHandler{logger: logger, level: &atomic.Int64{}}
+	h := &osSlogHandler{logger: logger, level: &atomic.Int64{}, state: &teeState{}}
 	h.level.Store(int64(slog.LevelInfo))
 	return h
 }
@@ -102,18 +155,73 @@ func (h *osSlogHandler) Handle(_ context.Context, r slog.Record) error {
 	})
 	line := b.String()
 
+	st := h.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.decided {
+		if !st.forward {
+			// A file logger already has this record; the OS log doesn't
+			// need it too.
+			return nil
+		}
+		return h.emit(r.Level, line)
+	}
+
+	// Not decided yet (see the ordering note above the type): hold onto it
+	// until decideFileLogger says whether to forward or discard it.
+	if len(st.buf) >= maxBufferedRecords {
+		if !st.droppedNoted {
+			st.droppedNoted = true
+			_ = h.logger.Warning("bento-ads: pre-decision log buffer full; oldest buffered Bento log records are being dropped")
+		}
+		st.buf = st.buf[1:]
+	}
+	st.buf = append(st.buf, bufferedRecord{level: r.Level, line: line})
+	return nil
+}
+
+// emit dispatches a rendered line to the right kservice.Logger method for
+// level, the same level->method mapping Handle always used.
+func (h *osSlogHandler) emit(level slog.Level, line string) error {
 	switch {
-	case r.Level >= slog.LevelError: // covers ERROR and our custom FATAL
+	case level >= slog.LevelError: // covers ERROR and our custom FATAL
 		return h.logger.Error(line)
-	case r.Level >= slog.LevelWarn:
+	case level >= slog.LevelWarn:
 		return h.logger.Warning(line)
-	case r.Level >= slog.LevelInfo:
+	case level >= slog.LevelInfo:
 		return h.logger.Info(line)
-	case r.Level >= slog.LevelDebug:
+	case level >= slog.LevelDebug:
 		return h.logger.Info("DEBUG " + line)
 	default: // our custom TRACE level, see the design note above
 		return h.logger.Info("TRACE " + line)
 	}
+}
+
+// decideFileLogger records whether the parsed config has a file logger and
+// resolves every record buffered up to this point: replayed (at their own
+// level, still via emit) if there is no file logger, discarded otherwise.
+// Only the first call takes effect -- see program.go, which calls this both
+// from the CLIOptOnConfigParse hook and, defensively, after RunCLI returns
+// in case that hook never fired.
+func (h *osSlogHandler) decideFileLogger(hasFileLogger bool) {
+	st := h.state
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.decided {
+		return
+	}
+	st.decided = true
+	st.forward = !hasFileLogger
+
+	buf := st.buf
+	st.buf = nil
+	if st.forward {
+		for _, rec := range buf {
+			_ = h.emit(rec.level, rec.line)
+		}
+	}
+	// Otherwise: the file logger already has these records on disk.
 }
 
 func writeAttr(b *strings.Builder, groups []string, a slog.Attr) {
@@ -139,13 +247,13 @@ func writeAttr(b *strings.Builder, groups []string, a slog.Attr) {
 }
 
 func (h *osSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	n := &osSlogHandler{logger: h.logger, level: h.level, groups: h.groups}
+	n := &osSlogHandler{logger: h.logger, level: h.level, groups: h.groups, state: h.state}
 	n.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
 	return n
 }
 
 func (h *osSlogHandler) WithGroup(name string) slog.Handler {
-	n := &osSlogHandler{logger: h.logger, level: h.level, attrs: h.attrs}
+	n := &osSlogHandler{logger: h.logger, level: h.level, attrs: h.attrs, state: h.state}
 	n.groups = append(append([]string{}, h.groups...), name)
 	return n
 }

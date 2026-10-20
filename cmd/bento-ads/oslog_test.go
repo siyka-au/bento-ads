@@ -4,29 +4,41 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 )
 
 // fakeOSLogger is a fake kservice.Logger that records each call instead of
 // writing to a real Windows Event Log / syslog, so the handler/writer
-// tests below can run without an OS service.
+// tests below can run without an OS service. program_test.go's lifecycle
+// tests call it from more than one goroutine (program.run logs "starting"
+// from its own goroutine while Stop logs "stopping" from the caller's), so
+// every method takes mu; tests still rely on channels for ordering, mu
+// only guards against torn/concurrent slice writes.
 type fakeOSLogger struct {
+	mu       sync.Mutex
 	errors   []string
 	warnings []string
 	infos    []string
 }
 
 func (f *fakeOSLogger) Error(v ...interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.errors = append(f.errors, fmt.Sprint(v...))
 	return nil
 }
 
 func (f *fakeOSLogger) Warning(v ...interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.warnings = append(f.warnings, fmt.Sprint(v...))
 	return nil
 }
 
 func (f *fakeOSLogger) Info(v ...interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.infos = append(f.infos, fmt.Sprint(v...))
 	return nil
 }
@@ -63,6 +75,7 @@ func TestOSSlogHandlerLevelMapping(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeOSLogger{}
 			h := newOSSlogHandler(fake)
+			h.decideFileLogger(false)   // no file logger: forward immediately, as these level-mapping tests assume
 			h.setLevel(slog.Level(-16)) // let everything through for this test
 
 			logger := slog.New(h)
@@ -82,6 +95,7 @@ func TestOSSlogHandlerLevelMapping(t *testing.T) {
 func TestOSSlogHandlerLevelMappingCatchesBreakage(t *testing.T) {
 	fake := &fakeOSLogger{}
 	h := newOSSlogHandler(fake)
+	h.decideFileLogger(false) // no file logger: forward immediately
 	h.setLevel(slog.Level(-16))
 	logger := slog.New(h)
 	logger.Error("boom")
@@ -100,6 +114,7 @@ func TestOSSlogHandlerLevelMappingCatchesBreakage(t *testing.T) {
 func TestOSSlogHandlerAttributesAsKeyValue(t *testing.T) {
 	fake := &fakeOSLogger{}
 	h := newOSSlogHandler(fake)
+	h.decideFileLogger(false) // no file logger: forward immediately
 	h.setLevel(slog.LevelInfo)
 
 	logger := slog.New(h)
@@ -111,6 +126,7 @@ func TestOSSlogHandlerAttributesAsKeyValue(t *testing.T) {
 func TestOSSlogHandlerLevelFiltering(t *testing.T) {
 	fake := &fakeOSLogger{}
 	h := newOSSlogHandler(fake)
+	h.decideFileLogger(false)  // no file logger: forward immediately
 	h.setLevel(slog.LevelInfo) // the Bento default
 
 	logger := slog.New(h)
@@ -226,4 +242,173 @@ func TestOSErrWriterCatchesBreakage(t *testing.T) {
 	if len(fake.errors) != 2 {
 		t.Fatalf("expected one ERROR entry per line, got %v", fake.errors)
 	}
+}
+
+// TestOSSlogHandlerFileLoggerSuppressesTee is the core new behavior: once
+// decideFileLogger(true) says a file logger is configured, no tee record
+// -- at any level -- reaches the OS log, since the file already keeps it.
+// Run against the pre-fix handler (no decideFileLogger at all, forwarding
+// unconditionally) this is exactly the test that would fail; see the
+// handback report for a demonstration against that old behavior.
+func TestOSSlogHandlerFileLoggerSuppressesTee(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16)) // let everything through the level filter
+	h.decideFileLogger(true)    // logger.file.path is set
+
+	logger := slog.New(h)
+	logger.Error("error record")
+	logger.Warn("warn record")
+	logger.Info("info record")
+	logger.Debug("debug record")
+
+	assertEqualStrings(t, "errors", fake.errors, nil)
+	assertEqualStrings(t, "warnings", fake.warnings, nil)
+	assertEqualStrings(t, "infos", fake.infos, nil)
+}
+
+// TestOSSlogHandlerNoFileLoggerForwardsTee is the mirror case: without a
+// file logger, tee records are the only record of what Bento's logger
+// emitted (a service's stdout is discarded), so they must still reach the
+// OS log, filtered by logger.level as before.
+func TestOSSlogHandlerNoFileLoggerForwardsTee(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.LevelInfo)
+	h.decideFileLogger(false) // logger.file.path is empty/absent
+
+	logger := slog.New(h)
+	logger.Debug("should be dropped by the level filter, not the gate")
+	logger.Info("should reach the OS log")
+
+	assertEqualStrings(t, "infos", fake.infos, []string{"should reach the OS log"})
+}
+
+// TestOSSlogHandlerBuffersUntilDecidedThenForwards covers the ordering gap
+// documented on osSlogHandler: records that arrive before
+// decideFileLogger has ever been called (as happens for Bento's own
+// config-summary/lint lines, logged before OnManagerInitialised runs) must
+// not be lost. If the decision turns out to be "no file logger", they are
+// flushed in order once decided.
+func TestOSSlogHandlerBuffersUntilDecidedThenForwards(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Info("buffered before the decision, record one")
+	logger.Error("buffered before the decision, record two")
+
+	// Nothing should have reached the OS log yet -- the decision hasn't
+	// been made.
+	assertEqualStrings(t, "infos", fake.infos, nil)
+	assertEqualStrings(t, "errors", fake.errors, nil)
+
+	h.decideFileLogger(false) // no file logger: flush the buffer
+
+	assertEqualStrings(t, "infos", fake.infos, []string{"buffered before the decision, record one"})
+	assertEqualStrings(t, "errors", fake.errors, []string{"buffered before the decision, record two"})
+
+	// And subsequent records after the decision still forward normally.
+	logger.Info("after the decision")
+	assertEqualStrings(t, "infos", fake.infos, []string{
+		"buffered before the decision, record one",
+		"after the decision",
+	})
+}
+
+// TestOSSlogHandlerBuffersUntilDecidedThenDiscards is the mirror case: if
+// the decision turns out to be "a file logger is configured", the buffered
+// records are discarded -- the file already has them -- rather than being
+// flushed to the OS log.
+func TestOSSlogHandlerBuffersUntilDecidedThenDiscards(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Info("buffered before the decision")
+
+	h.decideFileLogger(true) // a file logger is configured: discard
+
+	assertEqualStrings(t, "infos", fake.infos, nil)
+	assertEqualStrings(t, "errors", fake.errors, nil)
+
+	// Confirm the gate (not just an empty buffer) is why: a record logged
+	// after the decision is also suppressed.
+	logger.Info("after the decision")
+	assertEqualStrings(t, "infos", fake.infos, nil)
+}
+
+// TestOSSlogHandlerDecidesOnlyOnce guards against a second, contradictory
+// decideFileLogger call (there should only ever be one -- see program.go,
+// which calls it once from CLIOptOnConfigParse and once, defensively,
+// after RunCLI returns) silently flipping already-decided behavior.
+func TestOSSlogHandlerDecidesOnlyOnce(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	h.decideFileLogger(true)  // first decision: a file logger is configured
+	h.decideFileLogger(false) // must be a no-op
+
+	logger := slog.New(h)
+	logger.Info("after both decideFileLogger calls")
+
+	assertEqualStrings(t, "infos", fake.infos, nil)
+}
+
+// TestOSSlogHandlerBufferBoundDropsOldest proves the buffer held while
+// waiting for the decision is bounded: past maxBufferedRecords, the oldest
+// buffered record is dropped (with a single logged note, not one per
+// drop) rather than growing without bound.
+func TestOSSlogHandlerBufferBoundDropsOldest(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	// One more than the bound, each uniquely numbered so the survivors can
+	// be checked for which end got dropped.
+	for i := 0; i < maxBufferedRecords+1; i++ {
+		logger.Info(fmt.Sprintf("record %d", i))
+	}
+
+	// Exactly one "buffer full" note, logged as a warning the moment the
+	// bound was first exceeded -- not one per subsequent drop.
+	if len(fake.warnings) != 1 {
+		t.Fatalf("expected exactly one buffer-full warning, got %v", fake.warnings)
+	}
+
+	h.decideFileLogger(false) // flush what's left
+
+	if len(fake.infos) != maxBufferedRecords {
+		t.Fatalf("expected exactly %d flushed records (the bound), got %d", maxBufferedRecords, len(fake.infos))
+	}
+	if fake.infos[0] != "record 1" {
+		t.Fatalf("expected the oldest record (record 0) to have been dropped, leaving \"record 1\" first; got %q", fake.infos[0])
+	}
+	if fake.infos[len(fake.infos)-1] != fmt.Sprintf("record %d", maxBufferedRecords) {
+		t.Fatalf("expected the newest record to survive; got %q last", fake.infos[len(fake.infos)-1])
+	}
+}
+
+// TestOSSlogHandlerUndecidedFlushOnRunCLIExit simulates program.go's
+// defensive decideFileLogger(false) call after RunCLI returns, for the
+// case where the CLIOptOnConfigParse hook never fired at all (e.g. the
+// config failed to parse before OnManagerInitialised runs): no file logger
+// was ever established, so the buffer must still be flushed rather than
+// silently lost.
+func TestOSSlogHandlerUndecidedFlushOnRunCLIExit(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Error("config parse failure, logged before any hook could fire")
+
+	// program.go's post-RunCLI call, unconditionally.
+	h.decideFileLogger(false)
+
+	assertEqualStrings(t, "errors", fake.errors, []string{"config parse failure, logged before any hook could fire"})
 }
