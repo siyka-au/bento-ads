@@ -57,52 +57,13 @@ func (w *osErrWriter) Write(p []byte) (int, error) {
 // otherwise the only thing a Windows service's stderr/stdout-discarding
 // service manager leaves us.
 //
-// Design notes (see also the package doc comment above main.go's imports
-// and program.go's program.run):
-//
-//   - CLIOptAddTeeLegger wires this in as: cliOpts.opts.OnLoggerInit wraps
-//     the real configured logger `l` as log.TeeLogger(l, newAirGapLogger(ourSlogLogger)).
-//     internal/log's teeLogger (internal/log/tee.go) is a dumb fan-out: its
-//     Error/Warn/Info/Debug methods call straight through to *both* wrapped
-//     loggers with no level check of their own. All level filtering happens
-//     inside each wrapped logger's own Error/Warn/Info/Debug implementation.
-//     That means `l` (the real, configured-by-logger.level logger) decides
-//     for itself whether to actually emit a given call, but our tee branch
-//     (newAirGapLogger(ourSlogLogger) -> ourSlogLogger.Debug/Info/...)
-//     receives *every* call regardless of logger.level, unconditionally.
-//     So the filtering against logger.level required by this handler has
-//     to happen on our side -- inside Enabled below -- not upstream.
-//   - To learn logger.level we use service.CLIOptOnConfigParse (see
-//     program.go), which fires once the main config has been parsed, and
-//     read the "logger"/"level" field back out of it with
-//     ParsedConfig.FieldString. Enabled starts at slog.LevelInfo (Bento's
-//     own documented default) until that hook fires, so early output isn't
-//     silently dropped if a run never gets that far.
-//   - public/service's airGapLogger (public/service/logger.go), which
-//     wraps whatever CLIOptAddTeeLogger was given to satisfy log.Modular,
-//     forwards TRACE calls to a.l.Trace(...) only if the wrapped type has a
-//     literal Trace(string, ...any) method; *slog.Logger doesn't, so
-//     TRACE collapses to a plain a.l.Debug(...) call before it ever reaches
-//     this handler. The result: TRACE and DEBUG are indistinguishable once
-//     they get here -- both arrive as a slog.Record at slog.LevelDebug.
-//     There is therefore no way for this handler to tell them apart, and
-//     the "DEBUG/TRACE -> Info prefixed with the level" mapping below can
-//     only ever produce the "DEBUG" prefix in practice.
-//   - Bento's internal loggers call their Debug/Info/Warn/Error methods
-//     printf-style, e.g. Debug("reading %d bytes", n); airGapLogger passes
-//     that straight through as a.l.Debug(format, v...) with NO
-//     fmt.Sprintf applied first (see public/service/logger.go). Called on
-//     a real *slog.Logger, Debug(msg string, args ...any) treats `msg` as
-//     a literal (unexpanded %d and all) and tries to pair up `v` as
-//     alternating key/value attributes, which for printf-style arguments
-//     usually isn't an even list of strings -- slog renders the
-//     odd/mistyped entries as "!BADKEY". This is an existing rough edge in
-//     upstream Bento's airGapLogger/CLIOptAddTeeLogger design (not
-//     something introduced here): any caller teeing Bento's log into a
-//     real *slog.Logger via a LeveledLogger adapter hits it. We render
-//     whatever attrs slog produced rather than trying to recover the
-//     original arguments, which are gone by the time Handle sees the
-//     Record.
+// The tee receives every record regardless of logger.level -- Bento's own
+// configured logger does its own level filtering, but a tee branch gets
+// everything unconditionally -- so Enabled below does the filtering
+// instead, against a threshold set from logger.level via
+// service.CLIOptOnConfigParse (see program.go); it defaults to INFO until
+// that hook fires. TRACE has no distinct slog level of its own and arrives
+// here as DEBUG (see public/service/logger.go's airGapLogger.Trace).
 type osSlogHandler struct {
 	logger kservice.Logger
 	level  *atomic.Int64 // slog.Level, stored as int64

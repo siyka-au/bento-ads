@@ -20,20 +20,12 @@ const stopTimeout = 30 * time.Second
 // without actually terminating the test process.
 var osExit = os.Exit
 
-// program adapts bento-ads's own startup -- the exact same Bento CLI used
-// by the interactive path in main.go -- to kardianos/service's Interface,
-// so that running as an OS service and running interactively go through
-// one startup path rather than two. (Previously this type built its own
-// Stream from the config file via service.NewStreamBuilder().SetYAML,
-// a narrower schema than the CLI's that silently rejected CLI-only config
-// sections such as telemetry_resources; see the package doc comment above
-// main.go's imports.)
-//
-// os.Args under the service manager is exactly "-c <cfg> -e <env>"
-// (Config.Arguments, recorded at install time by `service install` --
-// see main.go), which service.RunCLI parses itself via Bento's own CLI,
-// the same as it would for an interactive run with those flags. So this
-// type carries no config/env path fields of its own.
+// program adapts bento-ads's own startup -- the same Bento CLI used by the
+// interactive path in main.go -- to kardianos/service's Interface, so that
+// running as a service and running interactively go through one startup
+// path. os.Args under the service manager is just "-c <cfg> -e <env>"
+// (recorded at install time by `service install`), which service.RunCLI
+// parses itself, so this type carries no config/env fields of its own.
 type program struct {
 	// cliOpts are the same CLIOptFuncs passed to the interactive
 	// service.RunCLI call in main.go, so that service mode builds and runs
@@ -115,33 +107,13 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 		return
 	}
 
-	// RunCLI returned on its own -- the pipeline ran out of input and
-	// ended, or an error path inside it returned rather than terminating
-	// the process -- without Stop ever being called. Left alone, Start's
-	// goroutine would simply end here and kardianos would have no reason
-	// to tell the service manager anything: the service would stay
-	// recorded as "Running" forever with nothing actually running behind
-	// it, which is exactly the silent-failure mode this whole change is
-	// meant to get rid of.
-	//
-	// kardianos's Program interface gives no "tell the service manager
-	// this service has failed" call -- Stop() is only ever invoked BY the
-	// manager, never the other way round, and calling svc.Stop() from
-	// inside Start's own goroutine both races the manager's control logic
-	// and (on Windows specifically) risks deadlocking the service control
-	// handler, which runs Stop on the same dispatcher thread that would
-	// need to process our self-issued stop. The documented way to signal
-	// an unexpected failure is instead to just exit the process: on
-	// Windows, golang.org/x/sys/windows/svc's dispatcher treats a process
-	// that exits without having gone through SERVICE_STOP_PENDING /
-	// SERVICE_STOPPED as a crash and the SCM records it as stopped due to
-	// an error (and will run any configured recovery actions); on
-	// Linux/BSD service managers (systemd, upstart, SysV, OpenRC, rc.d) a
-	// non-zero exit code with no corresponding stop request is likewise
-	// recorded as a failure. So: log it to the OS system log (this is a
-	// failure the normal Bento-logger-not-up-yet path doesn't cover
-	// either, since Bento's logger may have already shut down normally by
-	// this point) and exit non-zero.
+	// RunCLI returned on its own without Stop being called -- left alone the
+	// service would stay recorded as "Running" forever with nothing behind
+	// it. kardianos has no call to tell the service manager "this service
+	// has failed" (Stop is only ever invoked BY the manager), so the
+	// documented way to signal failure is to exit non-zero instead: both
+	// Windows' SCM and Linux/BSD service managers record an unannounced,
+	// non-zero exit as a failure.
 	exit := p.exit
 	if exit == nil {
 		exit = osExit
