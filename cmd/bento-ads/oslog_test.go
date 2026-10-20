@@ -289,7 +289,9 @@ func TestOSSlogHandlerNoFileLoggerForwardsTee(t *testing.T) {
 // decideFileLogger has ever been called (as happens for Bento's own
 // config-summary/lint lines, logged before OnManagerInitialised runs) must
 // not be lost. If the decision turns out to be "no file logger", they are
-// flushed in order once decided.
+// flushed in order once decided. Uses INFO/WARN, not ERROR -- ERROR skips
+// the buffer entirely (see TestOSSlogHandlerUndecidedErrorEmittedImmediately
+// and friends below).
 func TestOSSlogHandlerBuffersUntilDecidedThenForwards(t *testing.T) {
 	fake := &fakeOSLogger{}
 	h := newOSSlogHandler(fake)
@@ -297,17 +299,17 @@ func TestOSSlogHandlerBuffersUntilDecidedThenForwards(t *testing.T) {
 
 	logger := slog.New(h)
 	logger.Info("buffered before the decision, record one")
-	logger.Error("buffered before the decision, record two")
+	logger.Warn("buffered before the decision, record two")
 
 	// Nothing should have reached the OS log yet -- the decision hasn't
 	// been made.
 	assertEqualStrings(t, "infos", fake.infos, nil)
-	assertEqualStrings(t, "errors", fake.errors, nil)
+	assertEqualStrings(t, "warnings", fake.warnings, nil)
 
 	h.decideFileLogger(false) // no file logger: flush the buffer
 
 	assertEqualStrings(t, "infos", fake.infos, []string{"buffered before the decision, record one"})
-	assertEqualStrings(t, "errors", fake.errors, []string{"buffered before the decision, record two"})
+	assertEqualStrings(t, "warnings", fake.warnings, []string{"buffered before the decision, record two"})
 
 	// And subsequent records after the decision still forward normally.
 	logger.Info("after the decision")
@@ -411,4 +413,69 @@ func TestOSSlogHandlerUndecidedFlushOnRunCLIExit(t *testing.T) {
 	h.decideFileLogger(false)
 
 	assertEqualStrings(t, "errors", fake.errors, []string{"config parse failure, logged before any hook could fire"})
+}
+
+// TestOSSlogHandlerUndecidedErrorEmittedImmediately covers the os.Exit gap:
+// an ERROR logged before the file-logger decision must reach the OS log
+// right away, not wait in the buffer -- RunCLI can os.Exit (e.g. a
+// strict-lint failure) before decideFileLogger ever runs, which would lose
+// a merely-buffered ERROR for good.
+func TestOSSlogHandlerUndecidedErrorEmittedImmediately(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Error("undecided error")
+
+	assertEqualStrings(t, "errors", fake.errors, []string{"undecided error"})
+}
+
+// TestOSSlogHandlerUndecidedErrorNotReplayedOnFlush checks the other half
+// of the same fix: an ERROR emitted immediately while undecided must not
+// also be sitting in the buffer, or deciding "no file logger" afterwards
+// would log it a second time.
+func TestOSSlogHandlerUndecidedErrorNotReplayedOnFlush(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Error("undecided error")
+	h.decideFileLogger(false) // no file logger: flushes the buffer
+
+	assertEqualStrings(t, "errors", fake.errors, []string{"undecided error"})
+}
+
+// TestOSSlogHandlerUndecidedErrorEmittedEvenWithFileLogger is the accepted
+// trade-off: an ERROR logged before the decision goes out immediately even
+// if the decision turns out to be "there is a file logger" (which would
+// otherwise suppress it) -- a duplicate between the OS log and the file
+// log, accepted because losing the only copy to an early os.Exit is worse.
+func TestOSSlogHandlerUndecidedErrorEmittedEvenWithFileLogger(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+
+	logger := slog.New(h)
+	logger.Error("undecided error")
+	h.decideFileLogger(true) // a file logger is configured
+
+	assertEqualStrings(t, "errors", fake.errors, []string{"undecided error"})
+}
+
+// TestOSSlogHandlerPostDecisionFileLoggerDropsError confirms the suppression
+// rule is unchanged for records arriving after the decision: once a file
+// logger has been decided, a new ERROR is dropped like everything else,
+// only the undecided window above is special-cased.
+func TestOSSlogHandlerPostDecisionFileLoggerDropsError(t *testing.T) {
+	fake := &fakeOSLogger{}
+	h := newOSSlogHandler(fake)
+	h.setLevel(slog.Level(-16))
+	h.decideFileLogger(true) // a file logger is configured
+
+	logger := slog.New(h)
+	logger.Error("post-decision error")
+
+	assertEqualStrings(t, "errors", fake.errors, nil)
 }

@@ -53,39 +53,11 @@ func (w *osErrWriter) Write(p []byte) (int, error) {
 }
 
 // osSlogHandler is an slog.Handler that renders records onto a kservice
-// Logger, for use with service.CLIOptAddTeeLogger.
-//
-// Bento's own log records are only worth sending to the OS system log (the
-// Windows Application log, shared with every other program, capped at a
-// fixed size) when they would otherwise be lost entirely: a service's
-// stdout/stderr is discarded, but a configured file logger (logger.file)
-// already keeps every record on disk, as does Grafana once it has shipped
-// there. So the tee is forwarded only when the parsed config has no file
-// logger -- see hasFileLogger below, decided once from a
-// CLIOptOnConfigParse hook (program.go) -- and, even then, only at or above
-// logger.level.
-//
-// Ordering, found by reading ../bento's internal/cli/common (CreateLogger /
-// RunService): CreateLogger builds Bento's logger and applies the tee
-// (CLIOptOnLoggerInit) BEFORE confReader's lints/config-summary lines are
-// logged and BEFORE OnManagerInitialised (CLIOptOnConfigParse) ever runs --
-// so a handful of real tee records (the config summary, lint warnings, ...)
-// always arrive before the file-logger decision is made. Those records are
-// buffered (state.buf, bounded by maxBufferedRecords) rather than dropped
-// or guessed at, and are flushed or discarded once decideFileLogger is
-// called. If RunCLI returns without that hook ever firing (e.g. the config
-// failed to parse before OnManagerInitialised), program.go calls
-// decideFileLogger(false) itself once RunCLI returns, since in that case no
-// file logger was ever established and the buffered records are the only
-// record of what happened.
-//
-// The tee receives every record regardless of logger.level -- Bento's own
-// configured logger does its own level filtering, but a tee branch gets
-// everything unconditionally -- so Enabled below does the filtering
-// instead, against a threshold set from logger.level via
-// service.CLIOptOnConfigParse (see program.go); it defaults to INFO until
-// that hook fires. TRACE has no distinct slog level of its own and arrives
-// here as DEBUG (see public/service/logger.go's airGapLogger.Trace).
+// Logger, for use with service.CLIOptAddTeeLogger. It only forwards tee
+// records when the config has no file logger (logger.file already holds
+// them), filtered by logger.level; records arriving before that's decided
+// are buffered and flushed/discarded once it is, except ERROR+, which goes
+// out immediately since Bento can os.Exit before the decision is made.
 type osSlogHandler struct {
 	logger kservice.Logger
 	level  *atomic.Int64 // slog.Level, stored as int64
@@ -168,8 +140,16 @@ func (h *osSlogHandler) Handle(_ context.Context, r slog.Record) error {
 		return h.emit(r.Level, line)
 	}
 
-	// Not decided yet (see the ordering note above the type): hold onto it
-	// until decideFileLogger says whether to forward or discard it.
+	if r.Level >= slog.LevelError {
+		// Can't wait for the decision: Bento may os.Exit before
+		// decideFileLogger ever runs (e.g. a strict-lint failure), which
+		// would lose this from the buffer entirely. Emitted now, so it's
+		// deliberately not buffered below (no double emission on flush).
+		return h.emit(r.Level, line)
+	}
+
+	// Not decided yet: hold onto it until decideFileLogger says whether to
+	// forward or discard it.
 	if len(st.buf) >= maxBufferedRecords {
 		if !st.droppedNoted {
 			st.droppedNoted = true
@@ -198,12 +178,10 @@ func (h *osSlogHandler) emit(level slog.Level, line string) error {
 	}
 }
 
-// decideFileLogger records whether the parsed config has a file logger and
-// resolves every record buffered up to this point: replayed (at their own
-// level, still via emit) if there is no file logger, discarded otherwise.
-// Only the first call takes effect -- see program.go, which calls this both
-// from the CLIOptOnConfigParse hook and, defensively, after RunCLI returns
-// in case that hook never fired.
+// decideFileLogger resolves the buffer built up so far -- replayed if there's
+// no file logger, discarded otherwise -- and only the first call counts; see
+// program.go, which calls this from CLIOptOnConfigParse and, defensively,
+// once more after RunCLI returns in case that hook never fired.
 func (h *osSlogHandler) decideFileLogger(hasFileLogger bool) {
 	st := h.state
 	st.mu.Lock()

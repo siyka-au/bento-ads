@@ -79,13 +79,8 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 		runCLI = service.RunCLI
 	}
 
-	// bento-ads's own service lifecycle, logged directly to the OS system
-	// logger rather than through osSlogHandler's tee -- this is a handful
-	// of lines per start, nowhere near the volume that motivated gating the
-	// tee below, and must appear whether or not a file logger ends up
-	// configured. os.Args here is the service manager's invocation
-	// ("-c <cfg> -e <env>", baked in at `service install` time); os.Args[0]
-	// is the executable path, not a flag, hence the [1:].
+	// bento-ads's own lifecycle, logged directly to the OS logger (not the
+	// gated tee below) so it appears regardless of a file logger.
 	configPath, envPath := parseConfigArgs(os.Args[1:])
 	_ = p.osLogger.Info(fmt.Sprintf(
 		"bento-ads service starting (config=%q env=%q version=%s)",
@@ -105,12 +100,7 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 			if lvl, err := pConf.FieldString("logger", "level"); err == nil {
 				osSlogHandler.setLevel(parseLogLevel(lvl))
 			}
-			// A file logger (logger.file.path set) already keeps every
-			// record Bento's own logger emits on disk, so the tee to the
-			// OS log is only worth it when there isn't one -- see the
-			// design note on osSlogHandler in oslog.go. FieldString
-			// returns the env-interpolated value, same as the logger.level
-			// read above, so an interpolated path is still seen here.
+			// See osSlogHandler in oslog.go for why this gates the tee.
 			filePath, _ := pConf.FieldString("logger", "file", "path")
 			osSlogHandler.decideFileLogger(filePath != "")
 			return nil
@@ -122,11 +112,8 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 	// trigger graceful shutdown within shutdown_timeout).
 	runCLI(ctx, opts...)
 
-	// If the CLIOptOnConfigParse hook above never fired (e.g. the config
-	// failed to parse before OnManagerInitialised runs), no file logger was
-	// ever established, so any records buffered while waiting for the
-	// decision are the only record of what happened: flush them. A no-op
-	// if the hook already decided.
+	// A no-op if the hook above already decided; otherwise it never fired
+	// (e.g. the config failed to parse), so flush the buffer as undecided.
 	osSlogHandler.decideFileLogger(false)
 
 	p.mu.Lock()
@@ -182,14 +169,9 @@ func (p *program) Stop(s kservice.Service) error {
 	return nil
 }
 
-// buildVersion returns a short build identifier for the "service starting"
-// log line: the running binary's VCS revision and build time, from the Go
-// module's embedded build info, mirroring how Bento stamps its own
-// cli.Version (internal/cli/run.go) -- that package is internal to the
-// bento module so isn't importable here, hence reading debug.BuildInfo
-// directly instead. Returns "unknown" when no VCS info was embedded (e.g. a
-// `go build` outside a git checkout); this is informational only, so a
-// vaguer string here has no other effect.
+// buildVersion returns the binary's VCS revision/build time for the
+// "starting" log line (bento's own cli.Version isn't importable, it's
+// internal), or "unknown" if no VCS info was embedded.
 func buildVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
