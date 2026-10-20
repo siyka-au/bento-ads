@@ -50,6 +50,25 @@ container -- is unaffected and behaves exactly as in [Build](#build) above;
 the service machinery only activates for the `service` subcommand and when
 actually launched by the OS service manager.
 
+When launched by the OS service manager, service mode now runs through
+exactly the same startup path as an interactive run -- Bento's own CLI,
+given the same `-c`/`-e` flags baked in at install time -- rather than a
+separate, narrower code path, so a config that relies on CLI-only sections
+(`telemetry_resources`, `error_handling`, `logger.file`, metrics/tracer
+resources, etc.) works identically whichever way `bento-ads` was started.
+
+Until Bento's own logger is up -- and, once it is, for everything it logs,
+in addition to wherever `logger` in the config sends it -- service-mode
+output goes to the OS's system log: the Windows Event Log (Application log,
+source `bento-ads`) on Windows, syslog/journald on Linux. This matters
+because a service manager discards a service's stdout/stderr, so without
+this there would be nowhere to see a config that fails to load, or any log
+line at all, from an installed service. A `DEBUG`-level line only reaches
+the system log once `logger.level` in the config is set to `DEBUG` (or
+`TRACE`, which the system log can't distinguish from `DEBUG`); everything
+else follows the same `logger.level` threshold as the config's own log
+sink.
+
 ## Tests
 
 ```sh
