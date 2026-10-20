@@ -40,6 +40,18 @@ func isHelpArg(s string) bool {
 	return s == "-h" || s == "--help" || s == "help"
 }
 
+// commonCLIOpts are the CLIOptFuncs passed to service.RunCLI, identically,
+// whether bento-ads is run interactively (or as a container entrypoint) or
+// launched by the OS service manager -- see program.go's doc comment and
+// program.run, which appends the service-mode-only options (an OS-log
+// error writer and tee logger) to this same slice.
+func commonCLIOpts() []service.CLIOptFunc {
+	return []service.CLIOptFunc{
+		service.CLIOptSetBinaryName("bento-ads"),
+		service.CLIOptSetProductName("Bento"),
+	}
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "service" {
 		if len(os.Args) < 3 || isHelpArg(os.Args[2]) {
@@ -80,10 +92,11 @@ func main() {
 	}
 
 	// When launched by the OS service manager, os.Args[1:] is exactly
-	// svcConfig.Arguments as recorded at install time -- read the same -c/-e
-	// flags back out of it here.
-	configPath, envPath := parseConfigArgs(os.Args[1:])
-	prg := &program{configPath: configPath, envPath: envPath}
+	// svcConfig.Arguments as recorded at install time, i.e. "-c <cfg> -e
+	// <env>" -- service.RunCLI (via program.run) parses that itself
+	// through Bento's own CLI, the same as it would for an interactive
+	// run given those flags, so there's no need to read it out here too.
+	prg := &program{cliOpts: commonCLIOpts()}
 
 	svc, svcErr := kservice.New(prg, svcConfig)
 
@@ -101,20 +114,36 @@ func main() {
 	}
 
 	if svcErr == nil && !kservice.Interactive() {
-		// Launched by the OS service manager.
+		// Launched by the OS service manager. From here on, the OS system
+		// log (Windows Event Log / syslog, opened below) is the sink for
+		// everything bento-ads itself logs before program.run gets Bento's
+		// own logger teed into the same place -- stdout/stderr are
+		// discarded by the service manager, so anything written there is
+		// never seen. See oslog.go and program.go for the full design.
+		//
+		// svc.Logger(nil) and svc.SystemLogger(nil) are equivalent here:
+		// Logger returns a console logger only when kservice.Interactive()
+		// is true, which this branch has already excluded, so it falls
+		// through to the system logger either way. Logger is used since
+		// it's the conventional call in kardianos's own examples.
+		osLogger, logErr := svc.Logger(nil)
+		if logErr != nil {
+			// No OS logger to report through; this is the one failure
+			// this early that has nowhere to go but stderr.
+			fmt.Fprintln(os.Stderr, logErr)
+			os.Exit(1)
+		}
+		prg.osLogger = osLogger
+
 		if err := svc.Run(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			_ = osLogger.Error(err.Error())
 			os.Exit(1)
 		}
 		return
 	}
 
 	// Normal interactive (or container) use, unchanged.
-	service.RunCLI(
-		context.Background(),
-		service.CLIOptSetBinaryName("bento-ads"),
-		service.CLIOptSetProductName("Bento"),
-	)
+	service.RunCLI(context.Background(), commonCLIOpts()...)
 
 	if showServiceHelpAfter {
 		fmt.Println()
