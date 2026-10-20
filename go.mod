@@ -453,7 +453,7 @@ require (
 // go-ads is developed alongside; use the sibling checkout.
 replace github.com/siyka-au/go-ads/v3 => ../go-ads
 
-// Local bento fork (feat/telemetry-resources: telemetry_resources, OTLP logs
+// Local bento fork (siyka/main: telemetry_resources, OTLP logs
 // and metrics). Drop to use upstream warpstreamlabs/bento.
 replace github.com/warpstreamlabs/bento => ../bento
 
