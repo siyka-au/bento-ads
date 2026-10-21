@@ -244,8 +244,20 @@ $script:VerifyStagedBlock = {
         }
     }
 
+    $ok = (($mismatches.Count -eq 0) -and ($missing.Count -eq 0))
+    if ($ok) {
+        # staging\ otherwise sits world-readable (inherited ACLs) until
+        # Apply moves .env into place -- lock it here too, the moment its
+        # hash is confirmed.
+        $stagedEnvPath = Join-Path $stagingDir '.env'
+        if (Test-Path $stagedEnvPath) {
+            icacls $stagedEnvPath /inheritance:r | Out-Null
+            icacls $stagedEnvPath /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+        }
+    }
+
     [PSCustomObject]@{
-        Ok         = (($mismatches.Count -eq 0) -and ($missing.Count -eq 0))
+        Ok         = $ok
         Mismatches = $mismatches
         Missing    = $missing
     }
@@ -283,69 +295,113 @@ $script:ApplyBlock = {
         }
     }
 
+    # Locks a .env copy (live, staged or backed up) to Administrators+SYSTEM
+    # only, by well-known SID so this doesn't depend on OS locale. Called at
+    # every point a .env lands on disk -- the backup copy inherits the
+    # live file's old (possibly looser) ACL otherwise, and Copy-Item/
+    # Move-Item don't carry a source's explicit ACL across on their own.
+    function Protect-EnvFile {
+        param($Path)
+        if (Test-Path $Path) {
+            icacls $Path /inheritance:r | Out-Null
+            icacls $Path /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+        }
+    }
+
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backupDir = Join-Path $backupRoot $stamp
-    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-    foreach ($leaf in @('bento-ads.exe', $Params.ConfigFileName, '.env')) {
-        $src = Join-Path $remoteDir $leaf
-        if (Test-Path $src) {
-            Copy-Item -Path $src -Destination (Join-Path $backupDir $leaf) -Force
-        }
-    }
     $certBackupDir = Join-Path $backupDir 'certs'
-    foreach ($certName in $Params.CertFileNames) {
-        $src = Join-Path $remoteDir (Join-Path 'certs' $certName)
-        if (Test-Path $src) {
-            if (-not (Test-Path $certBackupDir)) { New-Item -ItemType Directory -Path $certBackupDir -Force | Out-Null }
-            Copy-Item -Path $src -Destination (Join-Path $certBackupDir $certName) -Force
-        }
-    }
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
-    foreach ($leaf in $Params.StagedFileNames) {
-        $src = Join-Path $stagingDir $leaf
-        if (-not (Test-Path $src)) { continue }
-        if ($Params.CertFileNames -contains $leaf) {
-            $dst = Join-Path $remoteDir (Join-Path 'certs' $leaf)
-        } elseif ($leaf -eq '.env') {
-            $dst = $envPath
-        } elseif ($leaf -eq 'bento-ads.exe') {
-            $dst = $exePath
-        } else {
-            $dst = Join-Path $remoteDir $leaf
+    try {
+        foreach ($leaf in @('bento-ads.exe', $Params.ConfigFileName, '.env')) {
+            $src = Join-Path $remoteDir $leaf
+            if (Test-Path $src) {
+                Copy-Item -Path $src -Destination (Join-Path $backupDir $leaf) -Force
+            }
         }
-        Move-Item -Path $src -Destination $dst -Force
-    }
+        Protect-EnvFile (Join-Path $backupDir '.env')
 
-    if (Test-Path $envPath) {
-        # Lock the env file (it holds credentials) to Administrators+SYSTEM
-        # only, by well-known SID so this doesn't depend on OS locale.
-        icacls $envPath /inheritance:r | Out-Null
-        icacls $envPath /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
-    }
-
-    if ($Params.NeedsReinstall) {
-        if ($existed) {
-            & $exePath service uninstall 2>&1 | Out-Null
-        }
-        & $exePath service install -c $configPath -e $envPath 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "bento-ads.exe service install exited $LASTEXITCODE"
+        foreach ($certName in $Params.CertFileNames) {
+            $src = Join-Path $remoteDir (Join-Path 'certs' $certName)
+            if (Test-Path $src) {
+                if (-not (Test-Path $certBackupDir)) { New-Item -ItemType Directory -Path $certBackupDir -Force | Out-Null }
+                Copy-Item -Path $src -Destination (Join-Path $certBackupDir $certName) -Force
+            }
         }
 
-        $rec = $Params.ServiceRecovery
-        $actions = "restart/$($rec.RestartDelaySec1 * 1000)/restart/$($rec.RestartDelaySec2 * 1000)/restart/$($rec.RestartDelaySec3 * 1000)"
-        $resetSec = $rec.ResetDays * 86400
-        sc.exe failure $serviceName reset= $resetSec actions= $actions | Out-Null
-    }
+        foreach ($leaf in $Params.StagedFileNames) {
+            $src = Join-Path $stagingDir $leaf
+            if (-not (Test-Path $src)) { continue }
+            if ($Params.CertFileNames -contains $leaf) {
+                $dst = Join-Path $remoteDir (Join-Path 'certs' $leaf)
+            } elseif ($leaf -eq '.env') {
+                $dst = $envPath
+            } elseif ($leaf -eq 'bento-ads.exe') {
+                $dst = $exePath
+            } else {
+                $dst = Join-Path $remoteDir $leaf
+            }
+            Move-Item -Path $src -Destination $dst -Force
+        }
+        Protect-EnvFile $envPath
 
-    $applyTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
-    Start-Service -Name $serviceName
+        if ($Params.NeedsReinstall) {
+            if ($existed) {
+                & $exePath service uninstall 2>&1 | Out-Null
+            }
+            & $exePath service install -c $configPath -e $envPath 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "bento-ads.exe service install exited $LASTEXITCODE"
+            }
 
-    # Trim old backups, oldest first, keeping the KeepBackups most recent.
-    $allBackups = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending
-    $toDelete = @($allBackups | Select-Object -Skip $Params.KeepBackups)
-    foreach ($old in $toDelete) {
-        Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            $rec = $Params.ServiceRecovery
+            $actions = "restart/$($rec.RestartDelaySec1 * 1000)/restart/$($rec.RestartDelaySec2 * 1000)/restart/$($rec.RestartDelaySec3 * 1000)"
+            $resetSec = $rec.ResetDays * 86400
+            sc.exe failure $serviceName reset= $resetSec actions= $actions | Out-Null
+        }
+
+        $applyTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
+        Start-Service -Name $serviceName
+
+        # Trim old backups, oldest first, keeping the KeepBackups most recent.
+        $allBackups = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending
+        $toDelete = @($allBackups | Select-Object -Skip $Params.KeepBackups)
+        foreach ($old in $toDelete) {
+            Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # The service is stopped (or was never running) at this point, and
+        # whatever got this far may have half-swapped live files. Put back
+        # whatever this attempt managed to back up, re-lock .env, and try
+        # to get the service running again before reporting the failure.
+        $applyError = $_.Exception.Message
+        $restoreNote = 'restored the previous build'
+        try {
+            foreach ($leaf in @('bento-ads.exe', $Params.ConfigFileName, '.env')) {
+                $backupFile = Join-Path $backupDir $leaf
+                if (Test-Path $backupFile) {
+                    Copy-Item -Path $backupFile -Destination (Join-Path $remoteDir $leaf) -Force
+                }
+            }
+            Protect-EnvFile $envPath
+            if (Test-Path $certBackupDir) {
+                Get-ChildItem -Path $certBackupDir -File | ForEach-Object {
+                    Copy-Item -Path $_.FullName -Destination (Join-Path $remoteDir (Join-Path 'certs' $_.Name)) -Force
+                }
+            }
+
+            $svcNow = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($svcNow) {
+                Start-Service -Name $serviceName -ErrorAction Stop
+                $restoreNote += ' and restarted it'
+            } else {
+                $restoreNote += ', but no service exists to restart it (needs `service install` by hand)'
+            }
+        } catch {
+            $restoreNote = "tried to restore and restart, but that failed too: $($_.Exception.Message)"
+        }
+        throw "Apply failed ($applyError); $restoreNote."
     }
 
     [PSCustomObject]@{
@@ -434,6 +490,13 @@ $script:RollbackBlock = {
 
     Get-ChildItem -Path $backupDir -File | ForEach-Object {
         Copy-Item -Path $_.FullName -Destination (Join-Path $remoteDir $_.Name) -Force
+    }
+    # Copy-Item doesn't carry the backup copy's locked-down ACL across;
+    # re-lock the restored live .env the same way Apply does.
+    $restoredEnvPath = Join-Path $remoteDir '.env'
+    if (Test-Path $restoredEnvPath) {
+        icacls $restoredEnvPath /inheritance:r | Out-Null
+        icacls $restoredEnvPath /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
     }
     $certBackupDir = Join-Path $backupDir 'certs'
     if (Test-Path $certBackupDir) {
@@ -538,7 +601,11 @@ function Send-StagedFile {
     param([Parameter(Mandatory)]$TargetCfg, [Parameter(Mandatory)][string]$LocalPath, [Parameter(Mandatory)][string]$RemoteName)
 
     $dest = "$($TargetCfg.User)@$($TargetCfg.Host)"
-    $remoteStaging = "$($TargetCfg.RemoteDir)\staging\$RemoteName"
+    # scp against this Windows OpenSSH server wants forward slashes in the
+    # remote path (backslashes get mangled); RemoteDir stays backslash-form
+    # everywhere else, so just swap them here.
+    $remoteDirFwd = $TargetCfg.RemoteDir -replace '\\', '/'
+    $remoteStaging = "$remoteDirFwd/staging/$RemoteName"
     & scp -i $TargetCfg.KeyFile -o IdentitiesOnly=yes $LocalPath "${dest}:${remoteStaging}" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "scp of $LocalPath to $dest failed (exit $LASTEXITCODE)"
@@ -599,11 +666,12 @@ function Main {
         Push-Location $RepoRoot
         $env:GOOS = 'windows'
         $env:GOARCH = 'amd64'
+        $env:CGO_ENABLED = '0'
         go build -trimpath -o $localExe ./cmd/bento-ads
         if ($LASTEXITCODE -ne 0) { throw "go build failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
-        Remove-Item Env:\GOOS, Env:\GOARCH -ErrorAction SilentlyContinue
+        Remove-Item Env:\GOOS, Env:\GOARCH, Env:\CGO_ENABLED -ErrorAction SilentlyContinue
     }
     $yFull = (& $localExe --version).Trim()
     $yTag = Get-VersionTag $yFull
@@ -695,16 +763,24 @@ function Main {
     $expectedPathName = "$($cfg.RemoteDir)\bento-ads.exe -c $($cfg.RemoteDir)\$configName -e $($cfg.RemoteDir)\.env"
     $needsReinstall = (-not $inv.ServiceExists) -or (-not (Test-PathNameMatches -Actual $inv.ServicePathName -Expected $expectedPathName))
 
-    $apply = Invoke-RemoteBlock -Block $script:ApplyBlock -TargetCfg $cfg -BlockParams @{
-        RemoteDir       = $cfg.RemoteDir
-        ServiceName     = $cfg.ServiceName
-        ConfigFileName  = $configName
-        CertFileNames   = $certNames
-        StagedFileNames = @($toStage.Keys)
-        NeedsReinstall  = $needsReinstall
-        ServiceRecovery = $cfg.ServiceRecovery
-        StopTimeoutSec  = $script:StopTimeoutSec
-        KeepBackups     = $script:KeepBackups
+    try {
+        $apply = Invoke-RemoteBlock -Block $script:ApplyBlock -TargetCfg $cfg -BlockParams @{
+            RemoteDir       = $cfg.RemoteDir
+            ServiceName     = $cfg.ServiceName
+            ConfigFileName  = $configName
+            CertFileNames   = $certNames
+            StagedFileNames = @($toStage.Keys)
+            NeedsReinstall  = $needsReinstall
+            ServiceRecovery = $cfg.ServiceRecovery
+            StopTimeoutSec  = $script:StopTimeoutSec
+            KeepBackups     = $script:KeepBackups
+        }
+    } catch {
+        # ApplyBlock itself already tried to restore and restart on
+        # failure (see its own catch) -- surface that outcome plainly
+        # rather than letting it scroll off inside ssh's error text.
+        Write-Host "Apply failed: $($_.Exception.Message)"
+        throw
     }
     Write-Host "  backup: $($apply.BackupDir)"
 

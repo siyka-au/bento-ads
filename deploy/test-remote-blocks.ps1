@@ -57,6 +57,15 @@ function Assert {
     if (-not $Condition) { throw "assertion failed: $Message" }
 }
 
+function Get-UnexpectedConsolePids {
+    <# Filters an InventoryBlock ConsoleProcessIds list down to pids this
+    harness didn't start and didn't already know about -- so a bento-ads.exe
+    the person happens to be running interactively (this is a dev machine,
+    not a clean VM) doesn't fail scenarios that have nothing to do with it. #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$ConsoleProcessIds)
+    return @($ConsoleProcessIds | Where-Object { $script:PreexistingConsolePids -notcontains $_ })
+}
+
 # -- safety checks --------------------------------------------------------------
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -66,6 +75,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     throw "A '$ServiceName' service already exists on this machine; refusing to run (these scenarios stop/uninstall it)."
+}
+
+# Snapshot any bento-ads.exe already running before these scenarios start
+# any of their own -- see Get-UnexpectedConsolePids above.
+$script:PreexistingConsolePids = @((Get-Process -Name 'bento-ads' -ErrorAction SilentlyContinue).Id)
+if ($script:PreexistingConsolePids.Count -gt 0) {
+    Write-ReportLine "Note: ignoring pre-existing bento-ads.exe process(es) not started by this harness: $($script:PreexistingConsolePids -join ', ')"
 }
 
 # -- fixtures ---------------------------------------------------------------------
@@ -79,10 +95,14 @@ $exePath = Join-Path $TempRoot 'build\bento-ads.exe'
 New-Item -ItemType Directory -Path (Split-Path $exePath) -Force | Out-Null
 Push-Location $RepoRoot
 try {
+    $env:GOOS = 'windows'
+    $env:GOARCH = 'amd64'
+    $env:CGO_ENABLED = '0'
     go build -trimpath -o $exePath ./cmd/bento-ads
     if ($LASTEXITCODE -ne 0) { throw "go build failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
+    Remove-Item Env:\GOOS, Env:\GOARCH, Env:\CGO_ENABLED -ErrorAction SilentlyContinue
 }
 $builtVersion = (& $exePath --version).Trim()
 $builtTag = Get-VersionTag $builtVersion
@@ -162,6 +182,7 @@ try {
 
         $invAfter = & $script:InventoryBlock @{ RemoteDir = $remoteDir; ServiceName = $ServiceName; ConfigFileName = $configNameV1; CertFileNames = @() }
         Assert (Test-PathNameMatches -Actual $invAfter.ServicePathName -Expected $script:expectedPathName) "installed PathName matches what we expected to install"
+        Assert ((Get-UnexpectedConsolePids $invAfter.ConsoleProcessIds).Count -eq 0) "no stray (non-service) bento-ads.exe besides any pre-existing one"
     }
 
     Invoke-Scenario 'same-version no-op detection' {
@@ -201,6 +222,7 @@ try {
 
         $invAfter = & $script:InventoryBlock @{ RemoteDir = $remoteDir; ServiceName = $ServiceName; ConfigFileName = $configNameV1; CertFileNames = @() }
         Assert ($invAfter.FileHashes.$configNameV1 -eq $newHash) "remote config now matches what we pushed"
+        Assert ((Get-UnexpectedConsolePids $invAfter.ConsoleProcessIds).Count -eq 0) "no stray (non-service) bento-ads.exe besides any pre-existing one"
     }
 
     Invoke-Scenario 'console-process detection' {
@@ -217,6 +239,7 @@ try {
         Start-Sleep -Seconds 1
         $invAfter = & $script:InventoryBlock @{ RemoteDir = $remoteDir; ServiceName = $ServiceName; ConfigFileName = $configNameV1; CertFileNames = @() }
         Assert (-not (@($invAfter.ConsoleProcessIds) -contains $proc.Id)) "console pid gone after stopping it"
+        Assert ((Get-UnexpectedConsolePids $invAfter.ConsoleProcessIds).Count -eq 0) "no other stray (non-service) bento-ads.exe besides any pre-existing one"
     }
 
     Invoke-Scenario 'verify step' {
