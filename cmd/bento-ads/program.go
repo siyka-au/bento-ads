@@ -83,7 +83,7 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 	// gated tee below) so it appears regardless of a file logger.
 	configPath, envPath := parseConfigArgs(os.Args[1:])
 	_ = p.osLogger.Info(fmt.Sprintf(
-		"bento-ads service starting (config=%q env=%q version=%s)",
+		`bento-ads service starting (config="%s" env="%s" version=%s)`,
 		configPath, envPath, buildVersion(),
 	))
 
@@ -178,16 +178,23 @@ func buildVersion() string {
 		return "unknown"
 	}
 	var revision, buildTime string
+	var modified bool
 	for _, s := range info.Settings {
 		switch s.Key {
 		case "vcs.revision":
 			revision = s.Value
 		case "vcs.time":
 			buildTime = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
 		}
 	}
 	if revision == "" {
 		return "unknown"
+	}
+	if modified {
+		// Built from uncommitted changes, so the revision alone is misleading.
+		revision += "-modified"
 	}
 	if buildTime != "" {
 		return revision + " (" + buildTime + ")"
