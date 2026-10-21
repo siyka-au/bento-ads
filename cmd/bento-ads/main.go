@@ -52,7 +52,19 @@ func commonCLIOpts() []service.CLIOptFunc {
 	}
 }
 
+// versionArgs are Bento's own --version flag and its -v alias
+// (internal/cli/run.go:192), recognised in both single- and double-dash
+// form since urfave/cli accepts either.
+var versionArgs = map[string]bool{"--version": true, "-version": true, "-v": true, "--v": true}
+
 func main() {
+	// Checked before anything else, and only as os.Args[1], so a
+	// subcommand's own flags of the same name are unaffected.
+	if len(os.Args) > 1 && versionArgs[os.Args[1]] {
+		fmt.Println(versionString())
+		return
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "service" {
 		if len(os.Args) < 3 || isHelpArg(os.Args[2]) {
 			fmt.Print(serviceHelp)

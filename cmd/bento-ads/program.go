@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -82,9 +81,10 @@ func (p *program) run(ctx context.Context, done chan struct{}) {
 	// bento-ads's own lifecycle, logged directly to the OS logger (not the
 	// gated tee below) so it appears regardless of a file logger.
 	configPath, envPath := parseConfigArgs(os.Args[1:])
+	info, _ := readBuildInfo()
 	_ = p.osLogger.Info(fmt.Sprintf(
 		`bento-ads service starting (config="%s" env="%s" version=%s)`,
-		configPath, envPath, buildVersion(),
+		configPath, envPath, adsVersion(info),
 	))
 
 	errWriter := &osErrWriter{logger: p.osLogger}
@@ -167,37 +167,4 @@ func (p *program) Stop(s kservice.Service) error {
 		_ = p.osLogger.Error("bento-ads: graceful shutdown did not finish within stopTimeout")
 	}
 	return nil
-}
-
-// buildVersion returns the binary's VCS revision/build time for the
-// "starting" log line (bento's own cli.Version isn't importable, it's
-// internal), or "unknown" if no VCS info was embedded.
-func buildVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "unknown"
-	}
-	var revision, buildTime string
-	var modified bool
-	for _, s := range info.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			revision = s.Value
-		case "vcs.time":
-			buildTime = s.Value
-		case "vcs.modified":
-			modified = s.Value == "true"
-		}
-	}
-	if revision == "" {
-		return "unknown"
-	}
-	if modified {
-		// Built from uncommitted changes, so the revision alone is misleading.
-		revision += "-modified"
-	}
-	if buildTime != "" {
-		return revision + " (" + buildTime + ")"
-	}
-	return revision
 }
