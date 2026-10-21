@@ -12,3 +12,7 @@ example/config*.yaml
 # Per-deployment/per-client MQTT TLS certificates and private keys.
 example/*.key
 example/*.crt
+
+# Per-machine deploy settings (host, keys, which config/certs to push).
+deploy/targets/*.psd1
+!deploy/targets/example.psd1

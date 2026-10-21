@@ -1,0 +1,761 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Build bento-ads and deploy it to a Windows target over SSH.
+.DESCRIPTION
+    Logs in to the target, creates its RemoteDir if needed, compares the
+    running version/files against what we'd push, and -- after
+    confirmation -- copies the binary and its config/env/cert files,
+    installs the service if missing or upgrades it if present, and starts
+    it. See deploy/README.md for the target file format and the flow.
+.PARAMETER Target
+    Name of a deploy/targets/<Target>.psd1 file (without the extension).
+.EXAMPLE
+    .\deploy\deploy.ps1 machine-01
+.EXAMPLE
+    .\deploy\deploy.ps1 machine-01 -Yes
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Target,
+
+    # Build from an uncommitted tree anyway (normally refused: the pushed
+    # binary's own --version would otherwise be the only record of exactly
+    # what's running).
+    [switch]$AllowDirty,
+
+    # Skip the "remote is X, we are pushing Y, continue?" and rollback
+    # prompts.
+    [switch]$Yes,
+
+    # Proceed even if the remote version and every file already match.
+    [switch]$Force
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+# Backup directories to keep under RemoteDir\backup\ (oldest deleted first).
+$script:KeepBackups = 5
+
+# How long Apply waits for the old process to exit after Stop-Service, and
+# Verify waits for the new one to be confirmed running, in seconds.
+$script:StopTimeoutSec = 45
+$script:VerifyTimeoutSec = 20
+
+#region Target loading --------------------------------------------------------
+
+function Get-DeployTarget {
+    <#
+    Loads deploy/targets/<Name>.psd1, applies defaults, and resolves its
+    local file paths against the repo root so the rest of the script can
+    use them without caring where it was invoked from.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    $path = Join-Path $RepoRoot "deploy/targets/$Name.psd1"
+    if (-not (Test-Path $path)) {
+        throw "No such target file: $path"
+    }
+    $data = Import-PowerShellDataFile -Path $path
+
+    foreach ($required in 'Host', 'User', 'KeyFile', 'ConfigFile', 'EnvFile') {
+        if (-not $data.ContainsKey($required) -or [string]::IsNullOrWhiteSpace($data[$required])) {
+            throw "Target '$Name' is missing required field '$required'"
+        }
+    }
+
+    if (-not $data.ContainsKey('RemoteDir') -or [string]::IsNullOrWhiteSpace($data.RemoteDir)) {
+        $data.RemoteDir = 'C:\bento'
+    }
+    if (-not $data.ContainsKey('CertFiles')) {
+        $data.CertFiles = @()
+    }
+    if (-not $data.ContainsKey('ServiceName') -or [string]::IsNullOrWhiteSpace($data.ServiceName)) {
+        $data.ServiceName = 'bento-ads'
+    }
+    if (-not $data.ContainsKey('ServiceRecovery')) {
+        $data.ServiceRecovery = @{}
+    }
+    $recoveryDefaults = @{RestartDelaySec1 = 60; RestartDelaySec2 = 60; RestartDelaySec3 = 300; ResetDays = 1 }
+    foreach ($kv in $recoveryDefaults.GetEnumerator()) {
+        if (-not $data.ServiceRecovery.ContainsKey($kv.Key)) { $data.ServiceRecovery[$kv.Key] = $kv.Value }
+    }
+
+    # KeyFile commonly starts with ~; ssh/scp handle that themselves, but
+    # Test-Path below needs it expanded.
+    $keyFileExpanded = $data.KeyFile -replace '^~', $HOME
+    if (-not (Test-Path $keyFileExpanded)) {
+        throw "Target '$Name': KeyFile not found: $($data.KeyFile)"
+    }
+
+    $data.ConfigFile = (Resolve-Path (Join-Path $RepoRoot $data.ConfigFile)).Path
+    $data.EnvFile = (Resolve-Path (Join-Path $RepoRoot $data.EnvFile)).Path
+    $data.CertFiles = @($data.CertFiles | ForEach-Object { (Resolve-Path (Join-Path $RepoRoot $_)).Path })
+
+    return [PSCustomObject]$data
+}
+
+#endregion
+
+#region Remote scriptblocks ---------------------------------------------------
+# Each block takes one $Params argument (a Hashtable when called directly --
+# see deploy/test-remote-blocks.ps1 -- or the PSCustomObject that
+# Invoke-RemoteBlock gets back from ConvertFrom-Json on the remote side;
+# property access with "." works on both) and returns one PSCustomObject.
+#
+# These run on Windows PowerShell 5.1 on the target (Invoke-RemoteBlock
+# ships them there via -EncodedCommand), so: no ternaries, no ??, no
+# -Parallel, no classes -- only syntax 5.1 understands. They also can't
+# call any function defined elsewhere in this file, since only the block's
+# own text is shipped; anything a block needs is written out inline.
+
+# Test-RemoteInventoryBlock: read-only. Reports what's on the target today
+# so Main can decide what, if anything, needs to change.
+$script:InventoryBlock = {
+    param($Params)
+
+    $remoteDir = $Params.RemoteDir
+    $serviceName = $Params.ServiceName
+    $exePath = Join-Path $remoteDir 'bento-ads.exe'
+
+    $result = @{
+        RemoteDirExists   = Test-Path $remoteDir
+        ExeExists         = Test-Path $exePath
+        VersionOutput     = $null
+        ExeSha256         = $null
+        ServiceExists     = $false
+        ServiceStatus     = $null
+        ServicePathName   = $null
+        ServiceProcessId  = $null
+        FileHashes        = @{}
+        ConsoleProcessIds = @()
+    }
+
+    if ($result.ExeExists) {
+        try {
+            $out = & $exePath '--version' 2>&1
+            $result.VersionOutput = ($out -join "`n").Trim()
+        } catch {
+            $result.VersionOutput = $null
+        }
+        if (-not ($result.VersionOutput -and $result.VersionOutput.StartsWith('bento-ads '))) {
+            # Pre-Part-A build, or --version failed outright: hash the exe
+            # so Main can report "legacy (<sha256 prefix>)" instead of a
+            # version it can't read.
+            $result.ExeSha256 = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
+        }
+    }
+
+    $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+    if ($svc) {
+        $result.ServiceExists = $true
+        $result.ServiceStatus = $svc.State
+        $result.ServicePathName = $svc.PathName
+        if ($svc.ProcessId -and $svc.ProcessId -gt 0) {
+            $result.ServiceProcessId = $svc.ProcessId
+        }
+    }
+
+    # Named files deployed next to the exe: config under its own name, the
+    # env file always as ".env", each cert under its own name in certs\.
+    $filesToHash = @{}
+    if ($Params.ConfigFileName) { $filesToHash[$Params.ConfigFileName] = Join-Path $remoteDir $Params.ConfigFileName }
+    $filesToHash['.env'] = Join-Path $remoteDir '.env'
+    foreach ($certName in $Params.CertFileNames) {
+        $filesToHash[$certName] = Join-Path $remoteDir (Join-Path 'certs' $certName)
+    }
+    foreach ($name in $filesToHash.Keys) {
+        $p = $filesToHash[$name]
+        if (Test-Path $p) {
+            $result.FileHashes[$name] = (Get-FileHash -Path $p -Algorithm SHA256).Hash
+        } else {
+            $result.FileHashes[$name] = $null
+        }
+    }
+
+    # A bento-ads.exe process NOT owned by the service would fight it for
+    # the MQTT client_id -- Main aborts outright if any turn up.
+    $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name='bento-ads.exe'" -ErrorAction SilentlyContinue
+    foreach ($proc in $procs) {
+        if (-not $result.ServiceProcessId -or $proc.ProcessId -ne $result.ServiceProcessId) {
+            $result.ConsoleProcessIds += $proc.ProcessId
+        }
+    }
+
+    [PSCustomObject]$result
+}
+
+# PrepareDirsBlock: creates the directories staging needs. Separate from
+# Inventory so it's never run for a dry inventory-only check.
+$script:PrepareDirsBlock = {
+    param($Params)
+
+    $remoteDir = $Params.RemoteDir
+    $dirs = @(
+        $remoteDir
+        (Join-Path $remoteDir 'logs')
+        (Join-Path $remoteDir 'certs')
+        (Join-Path $remoteDir 'staging')
+        (Join-Path $remoteDir 'backup')
+    )
+    $created = @()
+    foreach ($d in $dirs) {
+        if (-not (Test-Path $d)) {
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            $created += $d
+        }
+    }
+
+    [PSCustomObject]@{ Created = $created }
+}
+
+# VerifyStagedBlock: after scp, confirms what landed in staging\ hashes to
+# what Main expected to send -- catches a truncated/corrupted transfer
+# before Apply touches anything live.
+$script:VerifyStagedBlock = {
+    param($Params)
+
+    $stagingDir = Join-Path $Params.RemoteDir 'staging'
+    $mismatches = @()
+    $missing = @()
+    # ExpectedHashes is a Hashtable when called directly (its keys are its
+    # own .Keys, not .PSObject.Properties) or a PSCustomObject when it came
+    # back off the wire via ConvertFrom-Json (the reverse); -is picks the
+    # right way to list its keys either way.
+    if ($Params.ExpectedHashes -is [System.Collections.IDictionary]) {
+        $expectedNames = @($Params.ExpectedHashes.Keys)
+    } else {
+        $expectedNames = @($Params.ExpectedHashes.PSObject.Properties.Name)
+    }
+    foreach ($name in $expectedNames) {
+        $expected = $Params.ExpectedHashes.$name
+        $p = Join-Path $stagingDir $name
+        if (-not (Test-Path $p)) {
+            $missing += $name
+            continue
+        }
+        $actual = (Get-FileHash -Path $p -Algorithm SHA256).Hash
+        if ($actual -ne $expected) {
+            $mismatches += $name
+        }
+    }
+
+    [PSCustomObject]@{
+        Ok         = (($mismatches.Count -eq 0) -and ($missing.Count -eq 0))
+        Mismatches = $mismatches
+        Missing    = $missing
+    }
+}
+
+# ApplyBlock: stops the old process, backs it up, moves the staged files
+# into place, installs/upgrades the service as needed, and starts it.
+# NeedsReinstall is decided by Main (it needs the tolerant PathName
+# comparison, which lives there so it isn't duplicated in block text).
+$script:ApplyBlock = {
+    param($Params)
+
+    $remoteDir = $Params.RemoteDir
+    $serviceName = $Params.ServiceName
+    $exePath = Join-Path $remoteDir 'bento-ads.exe'
+    $configPath = Join-Path $remoteDir $Params.ConfigFileName
+    $envPath = Join-Path $remoteDir '.env'
+    $stagingDir = Join-Path $remoteDir 'staging'
+    $backupRoot = Join-Path $remoteDir 'backup'
+
+    $existed = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($existed) {
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        $deadline = (Get-Date).AddSeconds($Params.StopTimeoutSec)
+        $exited = $false
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Get-Process -Name 'bento-ads' -ErrorAction SilentlyContinue)) {
+                $exited = $true
+                break
+            }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $exited) {
+            throw "bento-ads.exe did not exit within $($Params.StopTimeoutSec)s of Stop-Service"
+        }
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupDir = Join-Path $backupRoot $stamp
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    foreach ($leaf in @('bento-ads.exe', $Params.ConfigFileName, '.env')) {
+        $src = Join-Path $remoteDir $leaf
+        if (Test-Path $src) {
+            Copy-Item -Path $src -Destination (Join-Path $backupDir $leaf) -Force
+        }
+    }
+    $certBackupDir = Join-Path $backupDir 'certs'
+    foreach ($certName in $Params.CertFileNames) {
+        $src = Join-Path $remoteDir (Join-Path 'certs' $certName)
+        if (Test-Path $src) {
+            if (-not (Test-Path $certBackupDir)) { New-Item -ItemType Directory -Path $certBackupDir -Force | Out-Null }
+            Copy-Item -Path $src -Destination (Join-Path $certBackupDir $certName) -Force
+        }
+    }
+
+    foreach ($leaf in $Params.StagedFileNames) {
+        $src = Join-Path $stagingDir $leaf
+        if (-not (Test-Path $src)) { continue }
+        if ($Params.CertFileNames -contains $leaf) {
+            $dst = Join-Path $remoteDir (Join-Path 'certs' $leaf)
+        } elseif ($leaf -eq '.env') {
+            $dst = $envPath
+        } elseif ($leaf -eq 'bento-ads.exe') {
+            $dst = $exePath
+        } else {
+            $dst = Join-Path $remoteDir $leaf
+        }
+        Move-Item -Path $src -Destination $dst -Force
+    }
+
+    if (Test-Path $envPath) {
+        # Lock the env file (it holds credentials) to Administrators+SYSTEM
+        # only, by well-known SID so this doesn't depend on OS locale.
+        icacls $envPath /inheritance:r | Out-Null
+        icacls $envPath /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    }
+
+    if ($Params.NeedsReinstall) {
+        if ($existed) {
+            & $exePath service uninstall 2>&1 | Out-Null
+        }
+        & $exePath service install -c $configPath -e $envPath 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "bento-ads.exe service install exited $LASTEXITCODE"
+        }
+
+        $rec = $Params.ServiceRecovery
+        $actions = "restart/$($rec.RestartDelaySec1 * 1000)/restart/$($rec.RestartDelaySec2 * 1000)/restart/$($rec.RestartDelaySec3 * 1000)"
+        $resetSec = $rec.ResetDays * 86400
+        sc.exe failure $serviceName reset= $resetSec actions= $actions | Out-Null
+    }
+
+    $applyTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Start-Service -Name $serviceName
+
+    # Trim old backups, oldest first, keeping the KeepBackups most recent.
+    $allBackups = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending
+    $toDelete = @($allBackups | Select-Object -Skip $Params.KeepBackups)
+    foreach ($old in $toDelete) {
+        Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    [PSCustomObject]@{
+        BackupDir     = $backupDir
+        Reinstalled   = [bool]$Params.NeedsReinstall
+        ApplyTimeUtc  = $applyTimeUtc
+        BackupsPruned = $toDelete.Count
+    }
+}
+
+# VerifyBlock: confirms the service is Running on a process that started
+# after Apply, that it logged a "starting" line for the version we pushed,
+# and that no bento-ads ERROR events have appeared since.
+$script:VerifyBlock = {
+    param($Params)
+
+    $serviceName = $Params.ServiceName
+    $sinceUtc = [datetime]::Parse($Params.SinceUtc).ToUniversalTime()
+    $deadline = (Get-Date).AddSeconds($Params.TimeoutSec)
+
+    $running = $false
+    $processStartTime = $null
+    while ((Get-Date) -lt $deadline) {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.State -eq 'Running' -and $svc.ProcessId -gt 0) {
+            $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($svc.ProcessId)" -ErrorAction SilentlyContinue
+            if ($proc) {
+                $processStartTime = [Management.ManagementDateTimeConverter]::ToDateTime($proc.CreationDate).ToUniversalTime()
+                if ($processStartTime -ge $sinceUtc.AddSeconds(-2)) {
+                    $running = $true
+                    break
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $foundStartEvent = $false
+    $startEventError = $null
+    try {
+        $events = Get-WinEvent -FilterHashtable @{LogName = 'Application'; ProviderName = 'bento-ads'; StartTime = $sinceUtc.AddSeconds(-2) } -ErrorAction Stop
+        foreach ($e in $events) {
+            if ($e.Message -like '*bento-ads service starting*' -and $e.Message -like "*version=$($Params.ExpectedVersion)*") {
+                $foundStartEvent = $true
+                break
+            }
+        }
+    } catch {
+        $startEventError = $_.Exception.Message
+    }
+
+    $errorEvents = @()
+    try {
+        $errs = Get-WinEvent -FilterHashtable @{LogName = 'Application'; ProviderName = 'bento-ads'; Level = 2; StartTime = $sinceUtc.AddSeconds(-2) } -ErrorAction Stop
+        foreach ($e in $errs) { $errorEvents += $e.Message }
+    } catch {
+        # No matching events is the success case (Get-WinEvent throws
+        # rather than returning empty); anything else is left for the
+        # caller via ErrorEventsCheckError.
+    }
+
+    [PSCustomObject]@{
+        ServiceRunning    = $running
+        ProcessStartUtc   = $processStartTime
+        FoundStartEvent   = $foundStartEvent
+        StartEventError   = $startEventError
+        ErrorEventsFound  = $errorEvents
+    }
+}
+
+# RollbackBlock: restores a backup directory over the live files and
+# restarts the service, for Main to call when Verify fails.
+$script:RollbackBlock = {
+    param($Params)
+
+    $remoteDir = $Params.RemoteDir
+    $serviceName = $Params.ServiceName
+    $backupDir = $Params.BackupDir
+
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds($Params.StopTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Name 'bento-ads' -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Seconds 1
+    }
+
+    Get-ChildItem -Path $backupDir -File | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination (Join-Path $remoteDir $_.Name) -Force
+    }
+    $certBackupDir = Join-Path $backupDir 'certs'
+    if (Test-Path $certBackupDir) {
+        Get-ChildItem -Path $certBackupDir -File | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination (Join-Path $remoteDir (Join-Path 'certs' $_.Name)) -Force
+        }
+    }
+
+    $restartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Start-Service -Name $serviceName
+
+    [PSCustomObject]@{ RestartTimeUtc = $restartTimeUtc }
+}
+
+# UninstallBlock: not part of the deploy flow -- used by
+# deploy/test-remote-blocks.ps1 to tear its scenarios down.
+$script:UninstallBlock = {
+    param($Params)
+
+    $serviceName = $Params.ServiceName
+    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        $exePath = Join-Path $Params.RemoteDir 'bento-ads.exe'
+        if (Test-Path $exePath) {
+            & $exePath service uninstall 2>&1 | Out-Null
+        }
+    }
+
+    [PSCustomObject]@{ Removed = [bool]$svc }
+}
+
+#endregion
+
+#region Remote transport -------------------------------------------------------
+
+function Invoke-RemoteBlock {
+    <#
+    Runs a scriptblock on $TargetCfg over ssh: params go in as JSON, the
+    block's own text is embedded verbatim, and the result comes back as
+    JSON after a sentinel line (so CLIXML/progress noise ahead of it on
+    stdout can be discarded). One ssh connection per call.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$Block,
+        [Parameter(Mandatory)]$TargetCfg,
+        [hashtable]$BlockParams = @{}
+    )
+
+    $paramsJson = $BlockParams | ConvertTo-Json -Depth 10 -Compress
+    $sentinel = '___DEPLOY_RESULT___'
+    $remoteScript = @"
+`$ProgressPreference = 'SilentlyContinue'
+`$blockParams = ConvertFrom-Json @'
+$paramsJson
+'@
+`$block = {
+$($Block.ToString())
+}
+`$result = & `$block `$blockParams
+Write-Output '$sentinel'
+ConvertTo-Json -InputObject `$result -Depth 10 -Compress
+"@
+
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteScript))
+    $keyFile = $TargetCfg.KeyFile
+    $dest = "$($TargetCfg.User)@$($TargetCfg.Host)"
+    $remoteCmd = "powershell -NoProfile -NonInteractive -EncodedCommand $encoded"
+
+    $output = & ssh -i $keyFile -o IdentitiesOnly=yes $dest $remoteCmd 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "ssh to $dest failed (exit $LASTEXITCODE): $($output -join "`n")"
+    }
+
+    $idx = -1
+    for ($i = 0; $i -lt $output.Count; $i++) {
+        if ($output[$i] -eq $sentinel) { $idx = $i; break }
+    }
+    if ($idx -lt 0) {
+        throw "no result sentinel in ssh output from $dest`:`n$($output -join "`n")"
+    }
+    $jsonText = ($output[($idx + 1)..($output.Count - 1)]) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        return $null
+    }
+    return $jsonText | ConvertFrom-Json
+}
+
+function Invoke-RemoteCommand {
+    <# Runs a plain command string over ssh, for one-liners not worth a block. #>
+    param([Parameter(Mandatory)]$TargetCfg, [Parameter(Mandatory)][string]$Command)
+
+    $dest = "$($TargetCfg.User)@$($TargetCfg.Host)"
+    $output = & ssh -i $TargetCfg.KeyFile -o IdentitiesOnly=yes $dest $Command 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "ssh to $dest failed (exit $LASTEXITCODE): $($output -join "`n")"
+    }
+    return $output
+}
+
+function Send-StagedFile {
+    param([Parameter(Mandatory)]$TargetCfg, [Parameter(Mandatory)][string]$LocalPath, [Parameter(Mandatory)][string]$RemoteName)
+
+    $dest = "$($TargetCfg.User)@$($TargetCfg.Host)"
+    $remoteStaging = "$($TargetCfg.RemoteDir)\staging\$RemoteName"
+    & scp -i $TargetCfg.KeyFile -o IdentitiesOnly=yes $LocalPath "${dest}:${remoteStaging}" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "scp of $LocalPath to $dest failed (exit $LASTEXITCODE)"
+    }
+}
+
+#endregion
+
+#region Comparison helpers (local, PS7) ---------------------------------------
+
+function Test-PathNameMatches {
+    <# Tolerant compare: Windows service PathName vs. what we'd install --
+    quoting and whitespace vary by kardianos/service version and by
+    whether a path happens to contain a space, neither of which is a real
+    difference. #>
+    param([string]$Actual, [string]$Expected)
+    if ([string]::IsNullOrWhiteSpace($Actual)) { return $false }
+    $norm = {
+        param($s)
+        (($s -replace '"', '') -replace '\s+', ' ').Trim()
+    }
+    return (& $norm $Actual) -eq (& $norm $Expected)
+}
+
+function Get-VersionTag {
+    <# Bare module version out of the "bento-ads v0.1.0 (...)" --version
+    line -- what program.go logs to the Event Log on service start. #>
+    param([string]$VersionOutput)
+    if ($VersionOutput -match '^bento-ads (\S+)') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+#endregion
+
+#region Main --------------------------------------------------------------------
+
+function Main {
+    if (-not $Target) {
+        throw "Usage: .\deploy\deploy.ps1 <target> [-AllowDirty] [-Yes] [-Force]"
+    }
+
+    $cfg = Get-DeployTarget -Name $Target
+    $configName = Split-Path $cfg.ConfigFile -Leaf
+    $certNames = @($cfg.CertFiles | ForEach-Object { Split-Path $_ -Leaf })
+
+    Write-Host "== Build =="
+    $dirty = (git -C $RepoRoot status --porcelain)
+    if ($dirty -and -not $AllowDirty) {
+        throw "Working tree is dirty; commit or pass -AllowDirty.`n$dirty"
+    }
+
+    $buildDir = Join-Path ([System.IO.Path]::GetTempPath()) ("bento-ads-deploy-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+    $localExe = Join-Path $buildDir 'bento-ads.exe'
+    try {
+        Push-Location $RepoRoot
+        $env:GOOS = 'windows'
+        $env:GOARCH = 'amd64'
+        go build -trimpath -o $localExe ./cmd/bento-ads
+        if ($LASTEXITCODE -ne 0) { throw "go build failed (exit $LASTEXITCODE)" }
+    } finally {
+        Pop-Location
+        Remove-Item Env:\GOOS, Env:\GOARCH -ErrorAction SilentlyContinue
+    }
+    $yFull = (& $localExe --version).Trim()
+    $yTag = Get-VersionTag $yFull
+    Write-Host "  built: $yFull"
+
+    Write-Host "== Inventory =="
+    $inv = Invoke-RemoteBlock -Block $script:InventoryBlock -TargetCfg $cfg -BlockParams @{
+        RemoteDir      = $cfg.RemoteDir
+        ServiceName    = $cfg.ServiceName
+        ConfigFileName = $configName
+        CertFileNames  = $certNames
+    }
+
+    if ($inv.ConsoleProcessIds -and $inv.ConsoleProcessIds.Count -gt 0) {
+        throw "bento-ads.exe is running on $($cfg.Host) outside the service (pid(s): $($inv.ConsoleProcessIds -join ', ')) -- it would fight the service for the MQTT client_id. Stop it first."
+    }
+
+    $xFull = $inv.VersionOutput
+    if (-not $inv.ExeExists) {
+        $xDisplay = 'not installed'
+    } elseif ($xFull -and $xFull.StartsWith('bento-ads ')) {
+        $xDisplay = $xFull
+    } else {
+        $prefix = if ($inv.ExeSha256) { $inv.ExeSha256.Substring(0, 12).ToLower() } else { 'unknown' }
+        $xDisplay = "legacy ($prefix)"
+    }
+    $xTag = Get-VersionTag $xFull
+
+    Write-Host "== Compare =="
+    Write-Host "  remote: $xDisplay"
+    Write-Host "  local:  $yFull"
+
+    $localFiles = @{ $configName = $cfg.ConfigFile; '.env' = $cfg.EnvFile }
+    for ($i = 0; $i -lt $certNames.Count; $i++) { $localFiles[$certNames[$i]] = $cfg.CertFiles[$i] }
+
+    $changed = @()
+    foreach ($name in $localFiles.Keys) {
+        $localHash = (Get-FileHash -Path $localFiles[$name] -Algorithm SHA256).Hash
+        $remoteHash = $inv.FileHashes.$name
+        if (-not $remoteHash) {
+            Write-Host "  $name`: new"
+            $changed += $name
+        } elseif ($remoteHash -ne $localHash) {
+            Write-Host "  $name`: changed"
+            $changed += $name
+        } else {
+            Write-Host "  $name`: unchanged"
+        }
+    }
+    $versionChanged = ($xFull -ne $yFull)
+    if ($versionChanged) { $changed += 'bento-ads.exe' }
+
+    if (-not $versionChanged -and $changed.Count -eq 0 -and -not $Force) {
+        Write-Host "Nothing to do."
+        return
+    }
+
+    if (-not $Yes) {
+        $resp = Read-Host "remote is $xDisplay, we are pushing $yFull, continue? [y/N]"
+        if ($resp -notmatch '^(y|yes)$') {
+            Write-Host "Aborted."
+            return
+        }
+    }
+
+    Write-Host "== Stage =="
+    Invoke-RemoteBlock -Block $script:PrepareDirsBlock -TargetCfg $cfg -BlockParams @{ RemoteDir = $cfg.RemoteDir } | Out-Null
+
+    $toStage = @{}
+    if ($versionChanged -or $changed -contains 'bento-ads.exe') {
+        Send-StagedFile -TargetCfg $cfg -LocalPath $localExe -RemoteName 'bento-ads.exe'
+        $toStage['bento-ads.exe'] = (Get-FileHash -Path $localExe -Algorithm SHA256).Hash
+    }
+    foreach ($name in $changed) {
+        if ($name -eq 'bento-ads.exe') { continue }
+        Send-StagedFile -TargetCfg $cfg -LocalPath $localFiles[$name] -RemoteName $name
+        $toStage[$name] = (Get-FileHash -Path $localFiles[$name] -Algorithm SHA256).Hash
+    }
+
+    $staged = Invoke-RemoteBlock -Block $script:VerifyStagedBlock -TargetCfg $cfg -BlockParams @{
+        RemoteDir      = $cfg.RemoteDir
+        ExpectedHashes = $toStage
+    }
+    if (-not $staged.Ok) {
+        throw "staged file hashes didn't match (missing: $($staged.Missing -join ', '); mismatched: $($staged.Mismatches -join ', '))"
+    }
+
+    Write-Host "== Apply =="
+    $expectedPathName = "$($cfg.RemoteDir)\bento-ads.exe -c $($cfg.RemoteDir)\$configName -e $($cfg.RemoteDir)\.env"
+    $needsReinstall = (-not $inv.ServiceExists) -or (-not (Test-PathNameMatches -Actual $inv.ServicePathName -Expected $expectedPathName))
+
+    $apply = Invoke-RemoteBlock -Block $script:ApplyBlock -TargetCfg $cfg -BlockParams @{
+        RemoteDir       = $cfg.RemoteDir
+        ServiceName     = $cfg.ServiceName
+        ConfigFileName  = $configName
+        CertFileNames   = $certNames
+        StagedFileNames = @($toStage.Keys)
+        NeedsReinstall  = $needsReinstall
+        ServiceRecovery = $cfg.ServiceRecovery
+        StopTimeoutSec  = $script:StopTimeoutSec
+        KeepBackups     = $script:KeepBackups
+    }
+    Write-Host "  backup: $($apply.BackupDir)"
+
+    Write-Host "== Verify =="
+    $verify = Invoke-RemoteBlock -Block $script:VerifyBlock -TargetCfg $cfg -BlockParams @{
+        ServiceName     = $cfg.ServiceName
+        SinceUtc        = $apply.ApplyTimeUtc
+        ExpectedVersion = $yTag
+        TimeoutSec      = $script:VerifyTimeoutSec
+    }
+
+    $ok = $verify.ServiceRunning -and $verify.FoundStartEvent -and (@($verify.ErrorEventsFound).Count -eq 0)
+    if ($ok) {
+        Write-Host "OK: $($cfg.Host) is running $yFull"
+        return
+    }
+
+    Write-Host "Verify failed: running=$($verify.ServiceRunning) startEvent=$($verify.FoundStartEvent) errors=$(@($verify.ErrorEventsFound).Count)"
+    $rollback = $Yes
+    if (-not $Yes) {
+        $resp = Read-Host "Roll back to the previous build? [y/N]"
+        $rollback = ($resp -match '^(y|yes)$')
+    }
+    if (-not $rollback) {
+        throw "Deploy verification failed; left as-is. Backup at $($apply.BackupDir)."
+    }
+
+    Invoke-RemoteBlock -Block $script:RollbackBlock -TargetCfg $cfg -BlockParams @{
+        RemoteDir      = $cfg.RemoteDir
+        ServiceName    = $cfg.ServiceName
+        BackupDir      = $apply.BackupDir
+        StopTimeoutSec = $script:StopTimeoutSec
+    } | Out-Null
+
+    $reverify = Invoke-RemoteBlock -Block $script:VerifyBlock -TargetCfg $cfg -BlockParams @{
+        ServiceName     = $cfg.ServiceName
+        SinceUtc        = (Get-Date).ToUniversalTime().ToString('o')
+        ExpectedVersion = $xTag
+        TimeoutSec      = $script:VerifyTimeoutSec
+    }
+    if ($reverify.ServiceRunning) {
+        throw "Deploy verification failed; rolled back to the previous build, which is running again."
+    }
+    throw "Deploy verification failed, and the rollback didn't come back up either. Check $($cfg.Host) by hand."
+}
+
+#endregion
+
+# Dot-sourcing (deploy/test-remote-blocks.ps1 does this) loads the
+# functions/scriptblocks above without running Main -- InvocationName is
+# "." only for a dot-sourced invocation, never a direct one.
+if ($MyInvocation.InvocationName -ne '.') {
+    Main
+}
