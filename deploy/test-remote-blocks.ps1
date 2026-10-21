@@ -242,6 +242,35 @@ try {
         Assert ((Get-UnexpectedConsolePids $invAfter.ConsoleProcessIds).Count -eq 0) "no other stray (non-service) bento-ads.exe besides any pre-existing one"
     }
 
+    Invoke-Scenario 'remote transport parses cleanly despite error-stream noise' {
+        # Runs the exact same wrapper Invoke-RemoteBlock ships over ssh
+        # (New-RemoteBlockScript/ConvertFrom-RemoteBlockOutput), but through
+        # a local, real Windows PowerShell 5.1 process (powershell.exe, not
+        # ssh) -- this is what actually broke against machine-01: a block
+        # that writes to the error stream (deliberately, here) must not
+        # corrupt the JSON result that comes after the sentinel.
+        $noisyBlock = {
+            param($Params)
+            Get-WinEvent -FilterHashtable @{LogName = 'Application'; ProviderName = 'a-provider-that-does-not-exist' } -ErrorAction SilentlyContinue | Out-Null
+            Write-Error 'simulated stray non-terminating error' -ErrorAction Continue
+            Write-Warning 'simulated stray warning'
+            [PSCustomObject]@{ Ok = $true }
+        }
+        $sentinel = '___DEPLOY_RESULT___'
+        $remoteScript = New-RemoteBlockScript -Block $noisyBlock -BlockParams @{} -Sentinel $sentinel
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteScript))
+        $stderrFile = Join-Path $TempRoot 'noisy-block-stderr.txt'
+        $stdout = @(& powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded 2>$stderrFile)
+        $exitCode = $LASTEXITCODE
+        $stderrRaw = Get-Content -Path $stderrFile -Raw -ErrorAction SilentlyContinue
+        Remove-Item -Path $stderrFile -ErrorAction SilentlyContinue
+
+        Assert ($exitCode -eq 0) "noisy block still exits 0"
+        Assert ([bool]$stderrRaw) "the block did write something to the error stream (otherwise this isn't testing anything)"
+        $result = ConvertFrom-RemoteBlockOutput -StdOut $stdout -Sentinel $sentinel
+        Assert ($result.Ok -eq $true) "result still parses correctly despite the error-stream noise"
+    }
+
     Invoke-Scenario 'verify step' {
         $verify = & $script:VerifyBlock @{
             ServiceName     = $ServiceName
