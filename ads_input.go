@@ -189,6 +189,10 @@ type adsCommInput struct {
 	loadSymbols bool
 	localMode   bool
 
+	// enums selects how an enum value renders in the message body; see the
+	// "enums" config field.
+	enums enumMode
+
 	// Route registration settings
 	routeUsername    string
 	routePassword    string
@@ -269,6 +273,7 @@ var adsConf = service.NewConfigSpec().
 	Field(service.NewStringField("routePassword").Description("Password for UDP route registration on the PLC.").Default("")).
 	Field(service.NewStringField("routeHostAddress").Description("The address the PLC should use to reach this client. Auto-detected from outbound connection if empty.").Default("")).
 	Field(service.NewBoolField("loadSymbols").Description("Download the full symbol and datatype table from the PLC on connect. Required for struct and array symbols. May cause a brief real-time jitter on the PLC; use with care on large programs.").Default(false)).
+	Field(service.NewStringEnumField("enums", "number", "name", "both").Description("How an enum value renders in the message body. 'number' is its declared integer value (default, unchanged from before go-ads decoded enums at all). 'name' is its declared constant name, or the number for a value the PLC holds that the enum doesn't declare. 'both' is {\"name\": ..., \"value\": ...}, name omitted when unknown.").Default("number")).
 	Field(service.NewBoolField("localMode").Description("Connect through the TwinCAT router on this machine (127.0.0.1) and let it assign the local AMS address, instead of using a route. Use for a runtime on the same host, e.g. a usermode runtime; targetAMS is still the runtime's own NetID.").Default(false).Advanced()).
 	Field(service.NewStringListField("symbols").Description("Symbols to read. Format: 'MAIN.var' or 'MAIN.var:maxDelayMs:cycleTimeMs'. " +
 		"Examples: 'MAIN.counter', '.globalCounter', 'MAIN.var:50:100'"))
@@ -406,6 +411,11 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		return nil, err
 	}
 
+	enums, err := conf.FieldString("enums")
+	if err != nil {
+		return nil, err
+	}
+
 	symbolList := createSymbolList(symbols, cycleTime, maxDelay)
 	m := &adsCommInput{
 		targetIP:         targetIP,
@@ -426,6 +436,7 @@ func adsCommInputFromConfig(conf *service.ParsedConfig, mgr *service.Resources) 
 		transmissionMode: transmissionMode,
 		loadSymbols:      loadSymbols,
 		localMode:        localMode,
+		enums:            enumMode(enums),
 		routeUsername:    routeUsername,
 		routePassword:    routePassword,
 		routeHostAddress: routeHostAddress,
@@ -716,7 +727,7 @@ func (g *adsCommInput) Connect(ctx context.Context) error {
 // and ts (when the value was sampled) as the RFC 3339 "timestamp" metadata.
 func (g *adsCommInput) makeMessage(symbol string, value any, ts time.Time) *service.Message {
 	msg := service.NewMessage(nil)
-	msg.SetStructuredMut(toBento(value))
+	msg.SetStructuredMut(toBento(value, g.enums))
 	msg.MetaSet("symbol_name", sanitize(symbol))
 	msg.MetaSet("timestamp", ts.Format(time.RFC3339Nano))
 	if m, ok := g.meta[symbol]; ok {

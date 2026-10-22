@@ -305,7 +305,7 @@ func checkScalars(t *testing.T, seed uint32, got map[string]sample) {
 			t.Errorf("%s: no message", c.field)
 			continue
 		}
-		if want := toBento(c.value(seed)); !reflect.DeepEqual(s.value, want) {
+		if want := toBento(c.value(seed), enumModeNumber); !reflect.DeepEqual(s.value, want) {
 			t.Errorf("%s (%s): %#v (%T), want %#v (%T)", c.field, c.dataType, s.value, s.value, want, want)
 		}
 		if s.dataType != c.dataType {
@@ -356,7 +356,7 @@ func TestIntegrationScalarsNotification(t *testing.T) {
 	got := collect(t, in, symbols, func(name string, v any) bool {
 		for _, c := range topLevelCases {
 			if sanitize(fb+c.field) == name {
-				return reflect.DeepEqual(v, toBento(c.value(seed)))
+				return reflect.DeepEqual(v, toBento(c.value(seed), enumModeNumber))
 			}
 		}
 		return false
@@ -425,7 +425,7 @@ func TestIntegrationStruct(t *testing.T) {
 		t.Errorf("nSeed = %#v, want uint32(%d)", fields["nSeed"], seed)
 	}
 	for _, c := range scalarCases {
-		if want := toBento(c.value(seed)); !reflect.DeepEqual(fields[c.field], want) {
+		if want := toBento(c.value(seed), enumModeNumber); !reflect.DeepEqual(fields[c.field], want) {
 			t.Errorf("stStructVar.%s = %#v (%T), want %#v (%T)", c.field, fields[c.field], fields[c.field], want, want)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/civil"
+	adsLib "github.com/siyka-au/go-ads/v3"
 	"github.com/warpstreamlabs/bento/public/bloblang"
 
 	// Registers the ts_* and parse_duration methods the mapping below uses.
@@ -38,9 +39,47 @@ func TestToBento(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := toBento(tt.in)
+			got := toBento(tt.in, enumModeNumber)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("toBento(%#v) = %#v (%T), want %#v (%T)", tt.in, got, got, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+// TestToBentoEnum covers the "enums" field's three modes on a top-level
+// value, an undeclared value (no declared constant name), and nested
+// (struct member, array element) positions -- mode must thread through
+// toBento's recursive calls unchanged.
+func TestToBentoEnum(t *testing.T) {
+	declared := adsLib.Enum{Value: 2, Name: "Running"}
+	undeclared := adsLib.Enum{Value: 99}
+
+	tests := []struct {
+		name string
+		mode enumMode
+		in   any
+		want any
+	}{
+		{"number, declared", enumModeNumber, declared, int64(2)},
+		{"number, undeclared", enumModeNumber, undeclared, int64(99)},
+		{"name, declared", enumModeName, declared, "Running"},
+		{"name, undeclared falls back to the number", enumModeName, undeclared, int64(99)},
+		{"both, declared", enumModeBoth, declared, map[string]any{"name": "Running", "value": int64(2)}},
+		{"both, undeclared omits name", enumModeBoth, undeclared, map[string]any{"value": int64(99)}},
+
+		{"struct member, name mode", enumModeName,
+			map[string]any{"state": declared, "speed": int16(5)},
+			map[string]any{"state": "Running", "speed": int16(5)}},
+		{"array element, both mode", enumModeBoth,
+			[]any{declared, undeclared},
+			[]any{map[string]any{"name": "Running", "value": int64(2)}, map[string]any{"value": int64(99)}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toBento(tt.in, tt.mode)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("toBento(%#v, %s) = %#v, want %#v", tt.in, tt.mode, got, tt.want)
 			}
 		})
 	}
@@ -54,7 +93,7 @@ func TestToBentoValuesWorkInBloblang(t *testing.T) {
 		"date": civil.Date{Year: 2024, Month: 2, Day: 29},
 		"time": 25*time.Hour + time.Minute + time.Second + time.Millisecond,
 		"tod":  civil.Time{Hour: 13, Minute: 45, Second: 0, Nanosecond: 1_000_000},
-	})
+	}, enumModeNumber)
 	exe, err := bloblang.Parse(`
 root.dt_rfc3339 = this.dt.ts_format("2006-01-02T15:04:05.999999999Z07:00")
 root.dt_unix_ns = this.dt.ts_unix_nano()

@@ -130,6 +130,7 @@ See `example/config.yaml`. The fields are:
 | `routeHostAddress` | | The address the PLC uses to reach this host (auto-detected if empty) |
 | `localMode` | `false` | Connect through the local TwinCAT router (runtime on this machine) |
 | `loadSymbols` | `false` | Download the full symbol and datatype table on connect (needed for structs and arrays) |
+| `enums` | `number` | How an enum value renders in the message body: `number` (its declared integer value, unchanged from before go-ads decoded enums at all), `name` (its declared constant name, or the number for an undeclared value), or `both` (`{"name": ..., "value": ...}`, `name` omitted when unknown) |
 | `logLevel` | `warn` | go-ads log level: `trace`, `debug`, `info`, `warn`, `error`, `disabled`. `disabled` drops everything, including reconnect failures, the PLC leaving RUN and heartbeat loss; records are also subject to Bento's own `logger.level` |
 | `symbols` | | `MAIN.var` or `MAIN.var:maxDelayMs:cycleTimeMs` |
 
