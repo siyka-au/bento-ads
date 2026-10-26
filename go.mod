@@ -451,7 +451,7 @@ require (
 )
 
 // go-ads is developed alongside; use the sibling checkout.
-replace github.com/siyka-au/go-ads/v3 => ../go-ads
+replace github.com/siyka-au/go-ads/v3 => ../../nepionic/go-ads
 
 // Local bento fork (siyka/main: telemetry_resources, OTLP logs
 // and metrics). Drop to use upstream warpstreamlabs/bento.

@@ -105,7 +105,7 @@ the input to your own Bento build, blank-import the package:
 import _ "github.com/siyka-au/bento-ads"
 ```
 
-go-ads is taken from the local fork at `../go-ads` through a `replace` directive in
+go-ads is taken from the local fork at `../../nepionic/go-ads` through a `replace` directive in
 `go.mod`. Change or drop that line to use a published version.
 
 ## Configuration
