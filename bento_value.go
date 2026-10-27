@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/civil"
-	adsLib "github.com/siyka-au/go-ads/v3"
+	adsLib "github.com/nepionic/go-ads/v3"
 )
 
 // enumMode selects how toBento renders an ads.Enum value, per the "enums"

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/siyka-au/go-ads/v3/ams"
+	"github.com/nepionic/go-ads/v3/ams"
 )
 
 // Read result labels for the ads_reads counter.

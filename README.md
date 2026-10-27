@@ -1,8 +1,8 @@
 # bento-ads
 
 A [Bento](https://github.com/warpstreamlabs/bento) input plugin that reads data from
-Beckhoff PLCs over ADS, built on [go-ads](https://github.com/siyka-au/go-ads)
-(`github.com/siyka-au/go-ads/v3`).
+Beckhoff PLCs over ADS, built on [go-ads](https://github.com/nepionic/go-ads)
+(`github.com/nepionic/go-ads/v3`).
 
 Started as a port of [benthosADS](https://github.com/RuneRoven/benthosADS) by
 Daniel Helmersson (MIT), moved from the Benthos/Redpanda plugin API to Bento's

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	adsLib "github.com/siyka-au/go-ads/v3"
-	"github.com/siyka-au/go-ads/v3/ams"
+	adsLib "github.com/nepionic/go-ads/v3"
+	"github.com/nepionic/go-ads/v3/ams"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"

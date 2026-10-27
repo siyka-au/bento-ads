@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/civil"
-	adsLib "github.com/siyka-au/go-ads/v3"
+	adsLib "github.com/nepionic/go-ads/v3"
 	"github.com/warpstreamlabs/bento/public/bloblang"
 
 	// Registers the ts_* and parse_duration methods the mapping below uses.

@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	adsLib "github.com/siyka-au/go-ads/v3"
-	"github.com/siyka-au/go-ads/v3/ams"
+	adsLib "github.com/nepionic/go-ads/v3"
+	"github.com/nepionic/go-ads/v3/ams"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"

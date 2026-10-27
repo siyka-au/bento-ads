@@ -23,8 +23,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/civil"
-	adsLib "github.com/siyka-au/go-ads/v3"
-	"github.com/siyka-au/go-ads/v3/ams"
+	adsLib "github.com/nepionic/go-ads/v3"
+	"github.com/nepionic/go-ads/v3/ams"
 )
 
 const fb = "Main.fbTypeTest."

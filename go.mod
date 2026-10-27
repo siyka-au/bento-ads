@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	cloud.google.com/go v0.123.0
 	github.com/kardianos/service v1.3.0
-	github.com/siyka-au/go-ads/v3 v3.0.1
+	github.com/nepionic/go-ads/v3 v3.0.1
 	github.com/warpstreamlabs/bento v1.21.2
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
@@ -451,7 +451,7 @@ require (
 )
 
 // go-ads is developed alongside; use the sibling checkout.
-replace github.com/siyka-au/go-ads/v3 => ../../nepionic/go-ads
+replace github.com/nepionic/go-ads/v3 => ../../nepionic/go-ads
 
 // Local bento fork (siyka/main: telemetry_resources, OTLP logs
 // and metrics). Drop to use upstream warpstreamlabs/bento.

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	adsLib "github.com/siyka-au/go-ads/v3"
-	"github.com/siyka-au/go-ads/v3/ams"
+	adsLib "github.com/nepionic/go-ads/v3"
+	"github.com/nepionic/go-ads/v3/ams"
 )
 
 // TestClassifyReadError pins each bounded reason to the error shape it is
